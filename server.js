@@ -12,6 +12,14 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 
+// ─── Security Headers & CORS (13AF) ─────────────────────────
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    next();
+});
+
 // ─── Static files ────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -21,6 +29,18 @@ app.use('/api', apiRoutes);
 // ─── SPA fallback — serve index.html for all non-API routes ─
 app.get('/{*splat}', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ─── Centralized Error Handler (13R.2) ────────────────────────
+app.use((err, req, res, next) => {
+    const statusCode = err.statusCode || err.status || 500;
+    const message = (statusCode >= 500 && process.env.NODE_ENV === 'production')
+        ? 'An unexpected server error occurred.'
+        : (err.message || 'Internal Server Error');
+    res.status(statusCode).json({
+        success: false,
+        error: message
+    });
 });
 
 // ─── Auto-save database periodically ────────────────────────

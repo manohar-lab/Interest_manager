@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { getDatabase, saveDatabase, closeDatabase, resetDatabase } = require('./connection');
+const { getDatabase, saveDatabase, closeDatabase, resetDatabase, seedDefaultUsers } = require('./connection');
 
 /**
  * Initialize the database: run schema.sql then seed.sql.
@@ -19,7 +19,11 @@ async function initDatabase() {
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
     db.run(schemaSql);
-    console.log('  ✓ Schema created (5 tables, indexes, triggers)');
+    console.log('  ✓ Schema created (tables, indexes, triggers)');
+
+    // Seed default administrative and staff users
+    seedDefaultUsers(db);
+    console.log('  ✓ Default security users seeded (admin, staff, viewer)');
 
     // Verify tables exist
     const tablesStmt = db.prepare(

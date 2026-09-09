@@ -204,45 +204,74 @@
         return res.json();
     }
 
+    const inFlightRequests = new Set();
+
     async function apiPost(url, data) {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify(data)
-        });
-        if (res.status === 401 && !url.includes('/auth/login') && !url.includes('/auth/pin/verify')) {
-            handleUnauthorized();
-            throw new Error('Session expired or unauthorized');
+        const reqKey = `POST:${url}:${JSON.stringify(data || {})}`;
+        if (inFlightRequests.has(reqKey)) {
+            throw new Error('Operation is already in progress. Please wait a moment.');
         }
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
-        return body;
+        inFlightRequests.add(reqKey);
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify(data)
+            });
+            if (res.status === 401 && !url.includes('/auth/login') && !url.includes('/auth/pin/verify')) {
+                handleUnauthorized();
+                throw new Error('Session expired or unauthorized');
+            }
+            const body = await res.json();
+            if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+            return body;
+        } finally {
+            inFlightRequests.delete(reqKey);
+        }
     }
 
     async function apiPut(url, data) {
-        const res = await fetch(url, {
-            method: 'PUT',
-            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify(data)
-        });
-        if (res.status === 401) {
-            handleUnauthorized();
-            throw new Error('Session expired or unauthorized');
+        const reqKey = `PUT:${url}:${JSON.stringify(data || {})}`;
+        if (inFlightRequests.has(reqKey)) {
+            throw new Error('Operation is already in progress. Please wait a moment.');
         }
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
-        return body;
+        inFlightRequests.add(reqKey);
+        try {
+            const res = await fetch(url, {
+                method: 'PUT',
+                headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify(data)
+            });
+            if (res.status === 401) {
+                handleUnauthorized();
+                throw new Error('Session expired or unauthorized');
+            }
+            const body = await res.json();
+            if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+            return body;
+        } finally {
+            inFlightRequests.delete(reqKey);
+        }
     }
 
     async function apiDelete(url) {
-        const res = await fetch(url, { method: 'DELETE', headers: getAuthHeaders() });
-        if (res.status === 401) {
-            handleUnauthorized();
-            throw new Error('Session expired or unauthorized');
+        const reqKey = `DELETE:${url}`;
+        if (inFlightRequests.has(reqKey)) {
+            throw new Error('Operation is already in progress. Please wait a moment.');
         }
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.error || body.details || `Request failed (${res.status})`);
-        return body;
+        inFlightRequests.add(reqKey);
+        try {
+            const res = await fetch(url, { method: 'DELETE', headers: getAuthHeaders() });
+            if (res.status === 401) {
+                handleUnauthorized();
+                throw new Error('Session expired or unauthorized');
+            }
+            const body = await res.json();
+            if (!res.ok) throw new Error(body.error || body.details || `Request failed (${res.status})`);
+            return body;
+        } finally {
+            inFlightRequests.delete(reqKey);
+        }
     }
 
     // ─── Login Screen Rendering (12N.1, 12N.3) ───────────────
@@ -440,37 +469,191 @@
     }
 
     // ═══════════════════════════════════════════════════════════
-    // DASHBOARD
+    // DASHBOARD (Part 7 & Part 13 Polish)
     // ═══════════════════════════════════════════════════════════
     async function renderDashboard() {
         mainContent.innerHTML = `
             <div class="page" id="page-dashboard">
-                <h2 class="page-title">Dashboard</h2>
-                <p class="page-subtitle">Your lending portfolio overview</p>
-                <div class="stat-grid" id="dashboard-stats">
-                    <div class="stat-card"><div class="stat-value accent" id="stat-people">—</div><div class="stat-label">People</div></div>
-                    <div class="stat-card"><div class="stat-value accent" id="stat-accounts">—</div><div class="stat-label">Accounts</div></div>
-                    <div class="stat-card"><div class="stat-value given" id="stat-given">—</div><div class="stat-label">Money Given</div></div>
-                    <div class="stat-card"><div class="stat-value taken" id="stat-taken">—</div><div class="stat-label">Money Taken</div></div>
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:var(--space-md); margin-bottom:var(--space-md);">
+                    <div>
+                        <h2 class="page-title">Portfolio Dashboard</h2>
+                        <p class="page-subtitle">Real-time lending performance, collection urgency & financial metrics</p>
+                    </div>
+                    <div style="display:flex; gap:var(--space-sm); flex-wrap:wrap;">
+                        <button class="btn btn-secondary btn-small" id="dash-btn-person">+ Add Person</button>
+                        <button class="btn btn-primary btn-small" id="dash-btn-loan">+ New Loan</button>
+                        <button class="btn btn-secondary btn-small" id="dash-btn-reports">📊 Reports</button>
+                    </div>
                 </div>
-                <div class="placeholder-card">
-                    <div class="icon">📊</div>
-                    <h3>Dashboard Coming Soon</h3>
-                    <p>Detailed summaries, charts, and financial insights will appear here in future steps.</p>
-                    <div class="status-badge"><span class="dot"></span>Database Connected</div>
+
+                <!-- KPI Cards -->
+                <div class="stat-grid" id="dashboard-stats" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: var(--space-lg);">
+                    <div class="stat-card">
+                        <div class="stat-value accent" id="stat-people">—</div>
+                        <div class="stat-label">Total People</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value accent" id="stat-accounts">—</div>
+                        <div class="stat-label">Active Loans</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value given" id="stat-principal">—</div>
+                        <div class="stat-label">Outstanding Principal</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" style="color:var(--accent-info, #6366f1);" id="stat-interest">—</div>
+                        <div class="stat-label">Outstanding Interest</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" style="color:var(--accent-success, #10b981);" id="stat-collected">—</div>
+                        <div class="stat-label">Total Collected</div>
+                    </div>
+                    <div class="stat-card" id="card-overdue" style="border-left: 4px solid var(--accent-danger, #ef4444);">
+                        <div class="stat-value" style="color:var(--accent-danger, #ef4444);" id="stat-overdue">—</div>
+                        <div class="stat-label">Overdue Amount</div>
+                    </div>
+                </div>
+
+                <!-- Two-Column Section: Collection Urgency & Recent Activity -->
+                <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: var(--space-lg);">
+                    
+                    <!-- Left: Due & Collection Urgency -->
+                    <div class="card" style="display:flex; flex-direction:column;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--space-md); border-bottom:1px solid var(--border-color); padding-bottom:var(--space-sm);">
+                            <h3 style="font-size:var(--font-md); font-weight:700; margin:0; display:flex; align-items:center; gap:8px;">
+                                <span>⏰</span> Collection Urgency
+                            </h3>
+                            <a href="#/due" class="btn btn-secondary btn-small" style="font-size:0.75rem;">View All Due →</a>
+                        </div>
+                        <div id="dash-due-container" style="flex:1;">
+                            <div style="text-align:center; padding:var(--space-lg); color:var(--text-muted);">Loading collection status…</div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Recent Activity Feed -->
+                    <div class="card" style="display:flex; flex-direction:column;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--space-md); border-bottom:1px solid var(--border-color); padding-bottom:var(--space-sm);">
+                            <h3 style="font-size:var(--font-md); font-weight:700; margin:0; display:flex; align-items:center; gap:8px;">
+                                <span>📝</span> Recent Activity
+                            </h3>
+                            <a href="#/transactions" class="btn btn-secondary btn-small" style="font-size:0.75rem;">All Transactions →</a>
+                        </div>
+                        <div id="dash-activity-container" style="flex:1;">
+                            <div style="text-align:center; padding:var(--space-lg); color:var(--text-muted);">Loading activity…</div>
+                        </div>
+                    </div>
+
                 </div>
             </div>
         `;
+
+        // Quick action listeners
+        const btnPerson = document.getElementById('dash-btn-person');
+        if (btnPerson) btnPerson.addEventListener('click', () => {
+            const addPersonBtn = document.getElementById('btn-add-person');
+            if (addPersonBtn) addPersonBtn.click();
+            else navigate('people');
+        });
+
+        const btnLoan = document.getElementById('dash-btn-loan');
+        if (btnLoan) btnLoan.addEventListener('click', () => {
+            const addLoanBtn = document.getElementById('btn-add-account');
+            if (addLoanBtn) addLoanBtn.click();
+            else navigate('accounts');
+        });
+
+        const btnRpt = document.getElementById('dash-btn-reports');
+        if (btnRpt) btnRpt.addEventListener('click', () => navigate('reports'));
+
         try {
-            const [pRes, aRes] = await Promise.all([apiGet('/api/people'), apiGet('/api/accounts')]);
-            const people = pRes.data || []; const accounts = aRes.data || [];
-            document.getElementById('stat-people').textContent = people.length;
-            document.getElementById('stat-accounts').textContent = accounts.length;
-            const givenTotal = accounts.filter(a => a.direction === 'MONEY_GIVEN').reduce((s, a) => s + a.outstanding_principal, 0);
-            const takenTotal = accounts.filter(a => a.direction === 'MONEY_TAKEN').reduce((s, a) => s + a.outstanding_principal, 0);
-            document.getElementById('stat-given').textContent = formatRupees(givenTotal);
-            document.getElementById('stat-taken').textContent = formatRupees(takenTotal);
-        } catch (err) { console.warn('Dashboard error:', err); }
+            const res = await apiGet('/api/dashboard');
+            const data = res.data || res;
+            const summary = data.summary || {};
+            const recentActivity = data.recent_activity || [];
+            const dueCollection = data.due_collection || {};
+            const collections = dueCollection.collections || [];
+
+            // Populate KPIs
+            document.getElementById('stat-people').textContent = summary.total_people || 0;
+            document.getElementById('stat-accounts').textContent = `${summary.active_accounts || 0} / ${summary.total_accounts || 0}`;
+            document.getElementById('stat-principal').textContent = formatRupees(summary.outstanding_principal_paisa || (summary.outstanding_principal * 100) || 0);
+            document.getElementById('stat-interest').textContent = formatRupees(summary.outstanding_interest_paisa || (summary.outstanding_interest * 100) || 0);
+            document.getElementById('stat-collected').textContent = formatRupees(summary.total_paid_paisa || (summary.total_paid * 100) || 0);
+            
+            const overduePaisa = (summary.overdue_amount_paisa !== undefined) ? summary.overdue_amount_paisa : (Math.round((summary.overdue_amount || 0) * 100));
+            document.getElementById('stat-overdue').textContent = formatRupees(overduePaisa);
+
+            // Populate Collection Urgency
+            const dueContainer = document.getElementById('dash-due-container');
+            if (collections.length === 0) {
+                dueContainer.innerHTML = `
+                    <div style="text-align:center; padding:var(--space-lg); color:var(--text-muted);">
+                        <div style="font-size:2rem; margin-bottom:8px;">✅</div>
+                        <div style="font-weight:600; color:var(--accent-success);">All Accounts In Good Standing</div>
+                        <p style="font-size:var(--font-xs); margin-top:4px;">No payments are currently due or overdue.</p>
+                    </div>
+                `;
+            } else {
+                dueContainer.innerHTML = `
+                    <div style="display:flex; flex-direction:column; gap:var(--space-xs);">
+                        ${collections.slice(0, 5).map(c => `
+                            <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; background:rgba(255,255,255,0.03); border:1px solid var(--border-color); border-radius:var(--radius-sm);">
+                                <div>
+                                    <div style="font-weight:600; font-size:var(--font-sm);">${escapeHtml(c.person_name || 'Person #' + c.person_id)}</div>
+                                    <div style="font-size:var(--font-xs); color:var(--text-muted);">
+                                        Loan #${c.account_id} • Due: ${formatDateDMY(c.due_date)}
+                                    </div>
+                                </div>
+                                <div style="text-align:right;">
+                                    <div style="font-weight:700; color:var(--accent-danger); font-size:var(--font-sm);">${formatRupees(c.overdue_amount_paisa || Math.round(c.overdue_amount * 100))}</div>
+                                    <span class="status-badge status-${(c.urgency || 'overdue').toLowerCase()}" style="font-size:0.65rem; padding:2px 6px;">${escapeHtml(c.urgency || 'OVERDUE')}</span>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            // Populate Recent Activity Feed
+            const actContainer = document.getElementById('dash-activity-container');
+            if (recentActivity.length === 0) {
+                actContainer.innerHTML = `
+                    <div style="text-align:center; padding:var(--space-lg); color:var(--text-muted);">
+                        <div style="font-size:2rem; margin-bottom:8px;">💳</div>
+                        <div>No Recent Transactions</div>
+                        <p style="font-size:var(--font-xs); margin-top:4px;">Disbursements and payments will appear here.</p>
+                    </div>
+                `;
+            } else {
+                actContainer.innerHTML = `
+                    <div style="display:flex; flex-direction:column; gap:var(--space-xs);">
+                        ${recentActivity.slice(0, 5).map(tx => {
+                            const isPayment = (tx.transaction_type || '').includes('RECEIVED') || (tx.type || '').includes('RECEIVED');
+                            const sign = isPayment ? '+' : '−';
+                            const color = isPayment ? 'var(--accent-success)' : 'var(--accent-warning, #f59e0b)';
+                            const amountPaisa = tx.amount_paisa !== undefined ? tx.amount_paisa : Math.round((tx.amount || 0) * 100);
+                            return `
+                                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; background:rgba(255,255,255,0.03); border:1px solid var(--border-color); border-radius:var(--radius-sm);">
+                                    <div>
+                                        <div style="font-weight:600; font-size:var(--font-sm);">${escapeHtml(tx.person_name || 'Person #' + (tx.person_id || ''))}</div>
+                                        <div style="font-size:var(--font-xs); color:var(--text-muted);">
+                                            ${formatDateDMY(tx.transaction_date || tx.created_at)} • ${escapeHtml(tx.transaction_type || tx.type || 'Transaction')}
+                                        </div>
+                                    </div>
+                                    <div style="text-align:right;">
+                                        <div style="font-weight:700; color:${color}; font-size:var(--font-sm);">${sign}${formatRupees(amountPaisa)}</div>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                `;
+            }
+
+        } catch (err) {
+            console.warn('Dashboard error:', err);
+            showToast('Could not load all dashboard metrics: ' + err.message, 'error');
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -2910,8 +3093,182 @@
         // Initial fetch
         loadTransactions();
     }
-    function renderDue() {
-        mainContent.innerHTML = `<div class="page"><h2 class="page-title">Due</h2><p class="page-subtitle">Upcoming and overdue payments</p><div class="placeholder-card"><div class="icon">⏰</div><h3>Coming Soon</h3><p>View payment deadlines, overdue accounts, and send reminders.</p><div class="status-badge"><span class="dot"></span>Schema Ready</div></div></div>`;
+    async function renderDue() {
+        mainContent.innerHTML = `
+            <div class="page" id="page-due">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:var(--space-md); margin-bottom:var(--space-md);">
+                    <div>
+                        <h2 class="page-title">Due & Overdue Tracking</h2>
+                        <p class="page-subtitle">Authoritative monitoring of upcoming maturities, grace periods & collection priorities</p>
+                    </div>
+                    <div style="display:flex; gap:var(--space-sm); flex-wrap:wrap;">
+                        <a href="/api/export/report/due-overdue" class="btn btn-secondary btn-small" download>📥 Export Due/Overdue .xlsx</a>
+                        <a href="/api/export/report/collections" class="btn btn-secondary btn-small" download>📥 Export Collections .xlsx</a>
+                    </div>
+                </div>
+
+                <!-- KPI Cards -->
+                <div class="stat-grid" id="due-stats" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: var(--space-lg);">
+                    <div class="stat-card" style="border-left: 4px solid var(--accent-info, #6366f1);">
+                        <div class="stat-value" id="due-kpi-count" style="color:var(--accent-info, #6366f1);">—</div>
+                        <div class="stat-label">Loans Due Soon / Today</div>
+                    </div>
+                    <div class="stat-card" style="border-left: 4px solid var(--accent-warning, #f59e0b);">
+                        <div class="stat-value" id="due-kpi-amount" style="color:var(--accent-warning, #f59e0b);">—</div>
+                        <div class="stat-label">Total Due Amount</div>
+                    </div>
+                    <div class="stat-card" style="border-left: 4px solid var(--accent-danger, #ef4444);">
+                        <div class="stat-value" id="overdue-kpi-count" style="color:var(--accent-danger, #ef4444);">—</div>
+                        <div class="stat-label">Overdue Loans</div>
+                    </div>
+                    <div class="stat-card" style="border-left: 4px solid var(--accent-danger, #ef4444);">
+                        <div class="stat-value" id="overdue-kpi-amount" style="color:var(--accent-danger, #ef4444);">—</div>
+                        <div class="stat-label">Total Overdue Amount</div>
+                    </div>
+                </div>
+
+                <!-- Filter Tabs -->
+                <div style="display:flex; gap:var(--space-xs); margin-bottom:var(--space-md);">
+                    <button class="btn btn-small due-tab-btn btn-primary" data-filter="all">All Actionable</button>
+                    <button class="btn btn-small due-tab-btn btn-secondary" data-filter="overdue">Overdue Only</button>
+                    <button class="btn btn-small due-tab-btn btn-secondary" data-filter="due">Due Only</button>
+                </div>
+
+                <!-- Collection Table Card -->
+                <div class="card" style="padding:0; overflow:hidden;">
+                    <div class="table-responsive">
+                        <table class="data-table" id="table-due-items" style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr>
+                                    <th>Borrower / Contact</th>
+                                    <th>Loan ID</th>
+                                    <th>Due Date</th>
+                                    <th>Status / Days</th>
+                                    <th style="text-align:right;">Outstanding Principal</th>
+                                    <th style="text-align:right;">Outstanding Interest</th>
+                                    <th style="text-align:right;">Total Actionable</th>
+                                    <th style="text-align:center;">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="due-table-body">
+                                <tr>
+                                    <td colspan="8" style="text-align:center; padding:var(--space-xl); color:var(--text-muted);">
+                                        Loading due & overdue collection records…
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        let activeFilter = 'all';
+        let allItems = [];
+
+        function renderTableRows() {
+            const tbody = document.getElementById('due-table-body');
+            if (!tbody) return;
+
+            let filtered = allItems;
+            if (activeFilter === 'overdue') {
+                filtered = allItems.filter(i => (i.urgency || i.status || '').toUpperCase().includes('OVERDUE'));
+            } else if (activeFilter === 'due') {
+                filtered = allItems.filter(i => !(i.urgency || i.status || '').toUpperCase().includes('OVERDUE'));
+            }
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="8" style="text-align:center; padding:var(--space-xl); color:var(--text-muted);">
+                            <div style="font-size:2rem; margin-bottom:8px;">🎉</div>
+                            <div style="font-weight:600; font-size:var(--font-md); color:var(--accent-success);">No Actionable Loans Found</div>
+                            <p style="font-size:var(--font-xs); margin-top:4px;">No loans match the selected filter.</p>
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = filtered.map(item => {
+                const isOverdue = (item.urgency || item.status || '').toUpperCase().includes('OVERDUE');
+                const badgeClass = isOverdue ? 'status-danger' : 'status-warning';
+                const badgeText = isOverdue ? (item.days_overdue ? `${item.days_overdue}d Overdue` : 'OVERDUE') : 'DUE';
+                const principalPaisa = item.outstanding_principal_paisa !== undefined ? item.outstanding_principal_paisa : Math.round((item.outstanding_principal || 0) * 100);
+                const interestPaisa = item.outstanding_interest_paisa !== undefined ? item.outstanding_interest_paisa : Math.round((item.outstanding_interest || 0) * 100);
+                const totalPaisa = item.overdue_amount_paisa !== undefined ? item.overdue_amount_paisa : Math.round((item.overdue_amount || (item.outstanding_principal + (item.outstanding_interest || 0))) * 100);
+
+                return `
+                    <tr>
+                        <td>
+                            <div style="font-weight:600;">${escapeHtml(item.person_name || 'Person #' + item.person_id)}</div>
+                            <div style="font-size:var(--font-xs); color:var(--text-muted);">${escapeHtml(item.phone || item.person_phone || '')}</div>
+                        </td>
+                        <td>
+                            <a href="#/account/${item.account_id || item.id}" style="color:var(--accent-primary); font-weight:600;">#${item.account_id || item.id}</a>
+                        </td>
+                        <td>${formatDateDMY(item.due_date)}</td>
+                        <td>
+                            <span class="status-badge ${badgeClass}" style="font-size:0.75rem;">${escapeHtml(badgeText)}</span>
+                        </td>
+                        <td style="text-align:right; font-weight:500;">${formatRupees(principalPaisa)}</td>
+                        <td style="text-align:right; font-weight:500;">${formatRupees(interestPaisa)}</td>
+                        <td style="text-align:right; font-weight:700; color:${isOverdue ? 'var(--accent-danger)' : 'var(--accent-warning)'};">
+                            ${formatRupees(totalPaisa)}
+                        </td>
+                        <td style="text-align:center;">
+                            <div style="display:inline-flex; gap:4px;">
+                                <a href="#/statement?person_id=${item.person_id}" class="btn btn-secondary btn-small" title="Statement" style="padding:4px 8px; font-size:0.7rem;">Statement</a>
+                                <a href="#/transactions" class="btn btn-primary btn-small" title="Record Payment" style="padding:4px 8px; font-size:0.7rem;">Pay</a>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // Tab filter click handlers
+        document.querySelectorAll('.due-tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.due-tab-btn').forEach(b => {
+                    b.classList.remove('btn-primary');
+                    b.classList.add('btn-secondary');
+                });
+                btn.classList.remove('btn-secondary');
+                btn.classList.add('btn-primary');
+                activeFilter = btn.dataset.filter;
+                renderTableRows();
+            });
+        });
+
+        try {
+            const [summaryRes, collRes] = await Promise.all([
+                apiGet('/api/due-overdue/summary'),
+                apiGet('/api/collections')
+            ]);
+
+            const summary = summaryRes.data || summaryRes;
+            allItems = collRes.items || collRes.data || [];
+
+            document.getElementById('due-kpi-count').textContent = summary.due_count || summary.due_loan_count || 0;
+            document.getElementById('due-kpi-amount').textContent = formatRupees(summary.due_amount_paisa || Math.round((summary.due_amount || 0) * 100));
+            document.getElementById('overdue-kpi-count').textContent = summary.overdue_count || summary.overdue_loan_count || 0;
+            document.getElementById('overdue-kpi-amount').textContent = formatRupees(summary.overdue_amount_paisa || Math.round((summary.overdue_amount || 0) * 100));
+
+            renderTableRows();
+        } catch (err) {
+            console.warn('Error loading due data:', err);
+            const tbody = document.getElementById('due-table-body');
+            if (tbody) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="8" style="text-align:center; padding:var(--space-lg); color:var(--accent-danger);">
+                            Failed to load due records: ${escapeHtml(err.message)}
+                        </td>
+                    </tr>
+                `;
+            }
+        }
     }
     function renderReports() {
         mainContent.innerHTML = `

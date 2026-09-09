@@ -320,4 +320,4 @@ function resetDatabase() {
     }
 }
 
-module.exports = { getDatabase, saveDatabase, closeDatabase, resetDatabase, DB_PATH };
+module.exports = { getDatabase, saveDatabase, closeDatabase, resetDatabase, seedDefaultUsers, DB_PATH };
