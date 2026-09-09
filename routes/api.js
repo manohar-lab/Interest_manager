@@ -3,9 +3,46 @@ const { getDatabase, saveDatabase } = require('../db/connection');
 const { queryAll, queryOne } = require('../db/helpers');
 const { createTransaction, allocatePayment } = require('../services/transactionService');
 
+const {
+    login,
+    logout,
+    changePassword,
+    setupPin,
+    verifyUserPin,
+    changePin,
+    resetPin,
+    requestPasswordReset,
+    completePasswordReset,
+    createUser,
+    setUserStatus,
+    listUsers,
+    ROLES
+} = require('../services/authService');
+
+const {
+    getNotifications,
+    getUnreadCount,
+    markAsRead,
+    markAllAsRead,
+    checkDueAndOverdueNotifications
+} = require('../services/notificationService');
+
+const {
+    authenticate,
+    requireRole,
+    requireAdmin,
+    requireStaffOrAdmin
+} = require('../middleware/authMiddleware');
+
+const {
+    loginLimiter,
+    pinLimiter,
+    resetLimiter
+} = require('../middleware/rateLimiter');
+
 const router = express.Router();
 
-// ─── Health Check ────────────────────────────────────────────
+// ─── Health Check (Public) ───────────────────────────────────
 router.get('/health', async (req, res) => {
     try {
         const db = await getDatabase();
@@ -18,6 +55,228 @@ router.get('/health', async (req, res) => {
         });
     } catch (err) {
         res.status(500).json({ status: 'error', message: err.message });
+    }
+});
+
+// ─── Public Authentication Routes (12B, 12G, 12L) ──────────────
+router.post('/auth/login', loginLimiter, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { username, password } = req.body;
+        const clientInfo = {
+            ip: req.ip || req.connection?.remoteAddress,
+            userAgent: req.headers['user-agent']
+        };
+        const authResult = login(db, username, password, clientInfo);
+        res.json({ success: true, ...authResult });
+    } catch (err) {
+        res.status(err.statusCode || 401).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/request-reset', resetLimiter, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { username } = req.body;
+        const result = requestPasswordReset(db, username);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/reset-password', resetLimiter, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { reset_token, new_password } = req.body;
+        const result = completePasswordReset(db, reset_token, new_password);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+// ─── Global Authentication Barrier (12A, 12E) ──────────────────
+router.use(authenticate);
+
+// ─── Viewer Write Guard (12E.2: Prevent Mutating Operations by VIEWER) ──
+router.use((req, res, next) => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+        if (req.user && req.user.role === ROLES.VIEWER) {
+            const allowedViewerRoutes = [
+                '/auth/logout',
+                '/auth/change-password',
+                '/auth/pin/setup',
+                '/auth/pin/verify',
+                '/auth/pin/change',
+                '/auth/pin/reset',
+                '/notifications/mark-all-read'
+            ];
+            const isReadPatch = req.path.startsWith('/notifications/') && req.path.endsWith('/read');
+            if (!allowedViewerRoutes.includes(req.path) && !isReadPatch) {
+                return res.status(403).json({
+                    success: false,
+                    error: `Permission denied. Role (${req.user.role}) is not authorized to perform write operations.`
+                });
+            }
+        }
+    }
+    next();
+});
+
+// ─── Authenticated Session & Security Routes (12B, 12D, 12J) ───
+router.post('/auth/logout', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const result = logout(db, req.token);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.get('/auth/me', (req, res) => {
+    res.json({ success: true, user: req.user });
+});
+
+router.post('/auth/change-password', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { current_password, new_password } = req.body;
+        const result = changePassword(db, req.user.id, current_password, new_password);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/pin/setup', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { pin, confirm_pin } = req.body;
+        const result = setupPin(db, req.user.id, pin, confirm_pin);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/pin/verify', pinLimiter, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { pin } = req.body;
+        const result = verifyUserPin(db, req.user.id, pin);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 401).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/pin/change', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { current_credential, new_pin, confirm_pin } = req.body;
+        const result = changePin(db, req.user.id, current_credential, new_pin, confirm_pin);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/pin/reset', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { password, new_pin, confirm_pin } = req.body;
+        const result = resetPin(db, req.user.id, password, new_pin, confirm_pin);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+// ─── User Administration (ADMIN only) ──────────────────────────
+router.get('/auth/users', requireAdmin, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const users = listUsers(db);
+        res.json({ success: true, items: users });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/auth/users', requireAdmin, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { username, password, role } = req.body;
+        const user = createUser(db, { username, password, role });
+        res.status(201).json({ success: true, user });
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+router.patch('/auth/users/:id/status', requireAdmin, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const userId = parseInt(req.params.id, 10);
+        const { status } = req.body;
+        const result = setUserStatus(db, userId, status);
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+// ─── Notifications Routes (12H, 12I) ───────────────────────────
+router.get('/notifications', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const result = getNotifications(db, req.user.id, req.query);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.get('/notifications/unread-count', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const count = getUnreadCount(db, req.user.id);
+        res.json({ success: true, unread_count: count });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.patch('/notifications/:id/read', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const id = parseInt(req.params.id, 10);
+        const result = markAsRead(db, id, req.user.id);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/notifications/mark-all-read', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const result = markAllAsRead(db, req.user.id);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/notifications/check-due', requireStaffOrAdmin, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const result = checkDueAndOverdueNotifications(db, req.query.as_of_date || req.body.as_of_date);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -364,6 +623,14 @@ router.post('/accounts', async (req, res) => {
             [result.id, JSON.stringify(newAccount)]
         );
 
+        // Step 6A: Initialize interest configuration
+        try {
+            db.run(`
+                INSERT INTO account_interest_configs (account_id, calculation_method, interest_rate, effective_from, effective_to)
+                VALUES (?, ?, ?, ?, NULL)
+            `, [result.id, method, rate, start_date]);
+        } catch (_) {}
+
         saveDatabase();
 
         res.status(201).json({
@@ -616,7 +883,11 @@ const {
     calculateTimelineInterest,
     recordInterest,
     getAccountInterestBalance,
-    accrueInterest
+    accrueInterest,
+    getInterestRecordAudit,
+    getAccountInterestAuditHistory,
+    reverseInterest,
+    getInterestCorrectionChain
 } = require('../services/interestService');
 
 router.get('/interest/foundation', (req, res) => {
@@ -850,7 +1121,12 @@ router.post('/accounts/:id/interest-records', async (req, res) => {
     try {
         const db = await getDatabase();
         const accountId = req.params.id;
-        const result = recordInterest(db, { ...req.body, account_id: accountId });
+        const result = recordInterest(db, {
+            ...req.body,
+            account_id: accountId,
+            source: 'MANUAL',
+            scheduler_run_id: null
+        }, { source: 'MANUAL', actorId: req.body.actor_id || req.body.actorId || 'API_USER' });
         saveDatabase();
         res.status(201).json({
             message: 'Interest recorded successfully',
@@ -865,7 +1141,11 @@ router.post('/accounts/:id/interest-records', async (req, res) => {
 router.post('/interest/record', async (req, res) => {
     try {
         const db = await getDatabase();
-        const result = recordInterest(db, req.body);
+        const result = recordInterest(db, {
+            ...req.body,
+            source: 'MANUAL',
+            scheduler_run_id: null
+        }, { source: 'MANUAL', actorId: req.body.actor_id || req.body.actorId || 'API_USER' });
         saveDatabase();
         res.status(201).json({
             message: 'Interest recorded successfully',
@@ -916,16 +1196,47 @@ router.post('/interest/accrue', async (req, res) => {
     }
 });
 
+const { accrueAndRecord } = require('../services/interestRecordingService');
+
+router.post('/interest/accrue-and-record', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const accountId = req.body.account_id || req.body.accountId;
+        const result = accrueAndRecord(db, accountId, req.body);
+        saveDatabase();
+        res.status(201).json({
+            message: 'Interest accrued and recorded successfully',
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
 router.post('/test/reset-state', async (req, res) => {
     try {
         const db = await getDatabase();
+        db.run('DELETE FROM accrual_run_details');
+        db.run('DELETE FROM accrual_runs');
         db.run('DELETE FROM interest_allocations');
         db.run('DELETE FROM interest_records');
+        db.run("DELETE FROM audit_logs WHERE entity_type = 'INTEREST_RECORD'");
         db.run('DELETE FROM transactions');
         db.run('DELETE FROM accounts WHERE id > 4');
-        db.run("UPDATE accounts SET principal = 200000, outstanding_principal = 200000, interest_rate = 15.0, status = 'ACTIVE' WHERE id IN (1, 2)");
-        db.run("UPDATE accounts SET principal = 500000, outstanding_principal = 500000, interest_rate = 18.0, status = 'ACTIVE' WHERE id = 3");
-        db.run("UPDATE accounts SET principal = 10000000, outstanding_principal = 10000000, interest_rate = 10.0, status = 'ACTIVE' WHERE id = 4");
+        db.run("UPDATE accounts SET principal = 200000, outstanding_principal = 200000, interest_rate = 15.0, interest_frequency = 'MONTHLY', calculation_method = 'SIMPLE_INTEREST', start_date = '2026-08-01', due_date = '2026-09-01', status = 'ACTIVE' WHERE id = 1");
+        db.run("UPDATE accounts SET principal = 200000, outstanding_principal = 200000, interest_rate = 15.0, interest_frequency = 'MONTHLY', calculation_method = 'SIMPLE_INTEREST', start_date = '2026-09-01', due_date = '2026-10-01', status = 'ACTIVE' WHERE id = 2");
+        db.run("UPDATE accounts SET principal = 500000, outstanding_principal = 500000, interest_rate = 18.0, interest_frequency = 'MONTHLY', calculation_method = 'SIMPLE_INTEREST', start_date = '2026-09-10', due_date = '2026-10-10', status = 'ACTIVE' WHERE id = 3");
+        db.run("UPDATE accounts SET principal = 10000000, outstanding_principal = 10000000, interest_rate = 10.0, interest_frequency = 'MONTHLY', calculation_method = 'SIMPLE_INTEREST', start_date = '2026-08-01', due_date = '2026-09-01', status = 'ACTIVE' WHERE id = 4");
+        db.run('DELETE FROM account_interest_configs WHERE account_id > 4');
+        db.run('DELETE FROM account_interest_configs WHERE account_id <= 4');
+        db.run(`
+            INSERT INTO account_interest_configs (account_id, calculation_method, interest_rate, effective_from, effective_to) VALUES
+            (1, 'SIMPLE_INTEREST', 15.0, '2026-08-01', NULL),
+            (2, 'SIMPLE_INTEREST', 15.0, '2026-09-01', NULL),
+            (3, 'SIMPLE_INTEREST', 18.0, '2026-09-10', NULL),
+            (4, 'SIMPLE_INTEREST', 10.0, '2026-08-01', NULL);
+        `);
         saveDatabase();
         res.json({ message: 'State reset successfully' });
     } catch (err) {
@@ -943,4 +1254,1170 @@ router.put('/transactions/:id', immutableTxHandler);
 router.patch('/transactions/:id', immutableTxHandler);
 router.delete('/transactions/:id', immutableTxHandler);
 
+// ─── Step 5K / 5L: Accrual Scheduler & Monitoring API ──────
+const {
+    runScheduler,
+    getAccrualRuns,
+    getAccrualRunById,
+    getFailedAccruals,
+    retryFailedAccrual
+} = require('../services/schedulerService');
+
+router.post('/scheduler/run', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = { ...req.body };
+
+        if (req.body.currentDate || req.body.current_date || req.body.as_of_date || req.body.asOfDate) {
+            options.currentDate = req.body.currentDate || req.body.current_date || req.body.as_of_date || req.body.asOfDate;
+        }
+
+        if (req.body.dryRun || req.body.dry_run) {
+            options.dryRun = true;
+        }
+
+        const result = runScheduler(db, options);
+        res.json({
+            message: 'Scheduler run completed',
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── Step 5L: List recent accrual runs (§16, §17) ───────────
+router.get('/scheduler/runs', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const runs = getAccrualRuns(db, req.query);
+        res.json({
+            message: 'Accrual runs retrieved successfully',
+            data: runs
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── Step 5L: Get specific run details (§18) ─────────────────
+router.get('/scheduler/runs/:id', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const runData = getAccrualRunById(db, req.params.id);
+        if (!runData) {
+            return res.status(404).json({ error: `Accrual run #${req.params.id} not found` });
+        }
+        res.json({
+            message: 'Accrual run details retrieved successfully',
+            data: runData
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── Step 5L: Get failed accrual attempts (§19) ──────────────
+router.get('/scheduler/failures', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const failures = getFailedAccruals(db, req.query);
+        res.json({
+            message: 'Failed accruals retrieved successfully',
+            data: failures
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── Step 5L: Controlled Manual Retry (§20, §21, §22) ────────
+router.post('/scheduler/retry/:detailId', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const result = retryFailedAccrual(db, req.params.detailId);
+        res.json({
+            message: result.message,
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Step 5M: Interest Accrual Audit & Financial Traceability
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Get audit history for an account (§21) ──────────────────
+router.get('/accounts/:id/interest-audit', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const accountId = req.params.id;
+        const auditHistory = getAccountInterestAuditHistory(db, accountId);
+        res.json({
+            message: 'Interest audit history retrieved successfully',
+            data: auditHistory
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── Get audit detail for a specific interest record (§22, §23, §26) ──
+router.get('/accounts/:id/interest-records/:recordId/audit', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const auditDetail = getInterestRecordAudit(db, req.params.recordId);
+        res.json({
+            message: 'Interest record audit retrieved successfully',
+            data: auditDetail
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+router.get('/interest-records/:id/audit', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const auditDetail = getInterestRecordAudit(db, req.params.id);
+        res.json({
+            message: 'Interest record audit retrieved successfully',
+            data: auditDetail
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Step 5N: Interest Correction & Reversal
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Reverse an interest record (§19, §20) ────────────────────
+const handleInterestReversal = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const recordId = req.params.recordId || req.params.id;
+        const result = reverseInterest(db, recordId, req.body);
+        saveDatabase();
+        res.json({
+            message: 'Interest record reversed successfully',
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.post('/accounts/:id/interest-records/:recordId/reverse', handleInterestReversal);
+router.post('/interest-records/:id/reverse', handleInterestReversal);
+
+// ─── Get correction history / chain for an interest record (§21, §22) ─
+const handleCorrectionHistory = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const recordId = req.params.recordId || req.params.id;
+        const result = getInterestCorrectionChain(db, recordId);
+        res.json({
+            message: 'Interest correction history retrieved successfully',
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/accounts/:id/interest-records/:recordId/correction-history', handleCorrectionHistory);
+router.get('/interest-records/:id/correction-history', handleCorrectionHistory);
+
+// ─── Prohibit audit log editing & deletion (Historical Immutability §11, §43, §49) ──
+const immutableAuditHandler = (req, res) => {
+    res.status(405).json({
+        error: 'Method Not Allowed: Audit log entries are immutable historical records. Editing and deletion are strictly prohibited.'
+    });
+};
+
+router.put('/audit-logs/:id', immutableAuditHandler);
+router.patch('/audit-logs/:id', immutableAuditHandler);
+router.delete('/audit-logs/:id', immutableAuditHandler);
+router.put('/accounts/:id/interest-records/:recordId/audit', immutableAuditHandler);
+router.patch('/accounts/:id/interest-records/:recordId/audit', immutableAuditHandler);
+router.delete('/accounts/:id/interest-records/:recordId/audit', immutableAuditHandler);
+router.put('/interest-records/:id/audit', immutableAuditHandler);
+router.patch('/interest-records/:id/audit', immutableAuditHandler);
+router.delete('/interest-records/:id/audit', immutableAuditHandler);
+
+// ─── Prohibit editing & deletion of reversals and correction chains ──
+const immutableReversalHandler = (req, res) => {
+    res.status(405).json({
+        error: 'Method Not Allowed: Reversal and correction records are immutable. Direct modification or deletion is prohibited.'
+    });
+};
+
+router.put('/accounts/:id/interest-records/:recordId/reverse', immutableReversalHandler);
+router.patch('/accounts/:id/interest-records/:recordId/reverse', immutableReversalHandler);
+router.delete('/accounts/:id/interest-records/:recordId/reverse', immutableReversalHandler);
+router.put('/interest-records/:id/reverse', immutableReversalHandler);
+router.patch('/interest-records/:id/reverse', immutableReversalHandler);
+router.delete('/interest-records/:id/reverse', immutableReversalHandler);
+
+router.put('/accounts/:id/interest-records/:recordId/correction-history', immutableReversalHandler);
+router.patch('/accounts/:id/interest-records/:recordId/correction-history', immutableReversalHandler);
+router.delete('/accounts/:id/interest-records/:recordId/correction-history', immutableReversalHandler);
+router.put('/interest-records/:id/correction-history', immutableReversalHandler);
+router.patch('/interest-records/:id/correction-history', immutableReversalHandler);
+router.delete('/interest-records/:id/correction-history', immutableReversalHandler);
+
+// ═══════════════════════════════════════════════════════════════
+// Step 6A: Loan Interest Configurations API
+// ═══════════════════════════════════════════════════════════════
+const {
+    createInterestConfig,
+    getAccountInterestConfigs,
+    getInterestConfigById,
+    updateInterestConfig,
+    getActiveInterestConfig
+} = require('../services/interestConfigService');
+
+// ─── List interest configurations for an account ─────────────
+router.get('/accounts/:id/interest-configs', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const configs = getAccountInterestConfigs(db, req.params.id);
+        res.json({
+            message: 'Account interest configurations retrieved successfully',
+            data: configs,
+            count: configs.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── Create a new interest configuration for an account ──────
+router.post('/accounts/:id/interest-configs', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const newConfig = createInterestConfig(db, req.params.id, req.body);
+        res.status(201).json({
+            message: 'Interest configuration created successfully',
+            data: newConfig
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message, errors: err.errors });
+    }
+});
+
+// ─── Get active interest configuration for an account ────────
+router.get('/accounts/:id/interest-configs/active', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const activeConfig = getActiveInterestConfig(db, req.params.id, req.query.date);
+        res.json({
+            message: activeConfig ? 'Active interest configuration retrieved' : 'No active configuration found for date',
+            data: activeConfig
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── Get single configuration by ID ──────────────────────────
+router.get('/interest-configs/:id', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const config = getInterestConfigById(db, req.params.id);
+        if (!config) {
+            return res.status(404).json({ error: `Interest configuration #${req.params.id} not found` });
+        }
+        res.json({
+            message: 'Interest configuration retrieved successfully',
+            data: config
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── Update configuration by ID (e.g. set effective_to) ───────
+router.put('/interest-configs/:id', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const updated = updateInterestConfig(db, req.params.id, req.body);
+        res.json({
+            message: 'Interest configuration updated successfully',
+            data: updated
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message, errors: err.errors });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// STEP 6H: INTEREST HISTORY ENDPOINTS (READ-ONLY)
+// ═══════════════════════════════════════════════════════════════
+const {
+    getAccountInterestHistory,
+    getPersonInterestHistory,
+    getInterestHistory,
+    getInterestRecordDetails
+} = require('../services/interestHistoryService');
+
+// ─── Account/Loan-Level Interest History ───────────────────────
+const handleAccountInterestHistory = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const history = getAccountInterestHistory(db, req.params.id, req.query);
+        res.json({
+            message: 'Account interest history retrieved successfully',
+            ...history,
+            data: history
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/accounts/:id/interest-history', handleAccountInterestHistory);
+router.get('/loans/:id/interest-history', handleAccountInterestHistory);
+router.get('/loans/:id/interest', handleAccountInterestHistory);
+
+// ─── Person-Level Interest History ────────────────────────────
+router.get('/people/:id/interest-history', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const history = getPersonInterestHistory(db, req.params.id, req.query);
+        res.json({
+            message: 'Person interest history retrieved successfully',
+            ...history,
+            data: history
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── General Interest History Query ───────────────────────────
+router.get('/interest-history', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const history = getInterestHistory(db, req.query, req.query);
+        res.json({
+            message: 'Interest history retrieved successfully',
+            ...history,
+            data: history
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ─── Single Interest Record History Detail ────────────────────
+router.get('/interest-records/:id/history-detail', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const detail = getInterestRecordDetails(db, req.params.id);
+        res.json({
+            message: 'Interest record details retrieved successfully',
+            data: detail
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// STEP 6I: INTEREST RECALCULATION & CORRECTION ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+const {
+    recalculateInterestForRecord,
+    correctInterestRecord
+} = require('../services/interestCorrectionService');
+
+// ─── Recalculate interest for a record (read-only preview) ────
+const handleRecalculate = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const recordId = req.params.recordId || req.params.id;
+        const result = recalculateInterestForRecord(db, recordId, req.body);
+        res.json({
+            message: 'Interest recalculation computed successfully',
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.post('/interest-records/:id/recalculate', handleRecalculate);
+router.post('/accounts/:id/interest-records/:recordId/recalculate', handleRecalculate);
+
+// ─── Correct an interest record (atomic replacement) ──────────
+const handleCorrection = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const recordId = req.params.recordId || req.params.id;
+        const result = correctInterestRecord(db, recordId, req.body);
+        res.json({
+            message: result.message || 'Interest record corrected successfully',
+            data: result
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message, code: err.code });
+    }
+};
+
+router.post('/interest-records/:id/correct', handleCorrection);
+router.post('/accounts/:id/interest-records/:recordId/correct', handleCorrection);
+
+// ═══════════════════════════════════════════════════════════════
+// STEP 7A/7B/7C/7D/7E/7F/7G/7H: DASHBOARD ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+const {
+    getDashboardSummary,
+    getLoanSummaries,
+    getPeopleSummaries,
+    getInterestPaymentSummary,
+    getDueCollectionSummary,
+    getCollectionItems,
+    getRecentActivity,
+    getIntegratedDashboard
+} = require('../services/dashboardService');
+
+router.get('/dashboard/summary', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {};
+        if (req.query.person_id) {
+            options.person_id = req.query.person_id;
+        }
+        const summary = getDashboardSummary(db, options);
+        res.json({
+            message: 'Dashboard summary retrieved successfully',
+            data: summary,
+            ...summary
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+});
+
+// Step 7C: Loan / Account Summaries
+const handleLoanSummaries = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            status: req.query.status || req.query.loan_status,
+            direction: req.query.direction
+        };
+        const items = getLoanSummaries(db, options);
+        res.json({
+            message: 'Loan summaries retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard/loans', handleLoanSummaries);
+router.get('/dashboard/accounts', handleLoanSummaries);
+
+// Step 7D: People / Customer Summaries
+const handlePeopleSummaries = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id
+        };
+        const items = getPeopleSummaries(db, options);
+        res.json({
+            message: 'People summaries retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard/people', handlePeopleSummaries);
+router.get('/dashboard/customers', handlePeopleSummaries);
+
+// Step 7E: Interest & Payment Financial Summary
+const handleFinancialSummary = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            account_id: req.query.account_id || req.query.loan_id
+        };
+        const summary = getInterestPaymentSummary(db, options);
+        res.json({
+            message: 'Financial summary retrieved successfully',
+            interest: summary.interest,
+            payments: summary.payments,
+            data: summary,
+            ...summary
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard/financial-summary', handleFinancialSummary);
+router.get('/dashboard/interest-payments', handleFinancialSummary);
+
+// Step 7F: Due & Collection Summary
+const handleDueSummary = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date
+        };
+        const summary = getDueCollectionSummary(db, options);
+        res.json({
+            message: 'Due and collection summary retrieved successfully',
+            data: summary,
+            ...summary
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard/due-summary', handleDueSummary);
+router.get('/dashboard/collections/summary', handleDueSummary);
+
+// Step 7F: Collection Items (Due / Overdue Loan List)
+const handleCollections = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date
+        };
+        const items = getCollectionItems(db, options);
+        res.json({
+            message: 'Collection items retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard/collections', handleCollections);
+router.get('/dashboard/collection-items', handleCollections);
+
+// Step 7G: Recent Activity Summary
+const handleRecentActivity = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            account_id: req.query.account_id || req.query.loan_id,
+            limit: req.query.limit
+        };
+        const items = getRecentActivity(db, options);
+        res.json({
+            message: 'Recent activity retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard/recent-activity', handleRecentActivity);
+router.get('/dashboard/activity', handleRecentActivity);
+
+// Step 7H: Integrated Dashboard Endpoint
+const handleIntegratedDashboard = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            limit: req.query.limit,
+            status: req.query.status || req.query.loan_status,
+            direction: req.query.direction
+        };
+        const dashboard = getIntegratedDashboard(db, options);
+        res.json({
+            message: 'Dashboard data retrieved successfully',
+            data: dashboard,
+            ...dashboard
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/dashboard', handleIntegratedDashboard);
+router.get('/dashboard/all', handleIntegratedDashboard);
+
+// ═══════════════════════════════════════════════════════════════
+// PART 8: DUE / OVERDUE TRACKING ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+const {
+    getDueOverdueSummary,
+    getDueLoans,
+    getOverdueLoans,
+    getCollectionItems: getPart8CollectionItems
+} = require('../services/dueTrackingService');
+
+// 8F.1: Due / Overdue Summary
+const handleDueOverdueSummary = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            account_id: req.query.account_id || req.query.loan_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period
+        };
+        const summary = getDueOverdueSummary(db, options);
+        res.json({
+            message: 'Due and overdue summary retrieved successfully',
+            data: summary,
+            ...summary
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/due-overdue/summary', handleDueOverdueSummary);
+router.get('/due/summary', handleDueOverdueSummary);
+router.get('/overdue/summary', handleDueOverdueSummary);
+
+// 8F.2: Due Loans
+const handleDueLoans = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            account_id: req.query.account_id || req.query.loan_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period,
+            limit: req.query.limit
+        };
+        const items = getDueLoans(db, options);
+        res.json({
+            message: 'Due loans retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/due', handleDueLoans);
+router.get('/due/loans', handleDueLoans);
+
+// 8F.3: Overdue Loans
+const handleOverdueLoans = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            account_id: req.query.account_id || req.query.loan_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period,
+            limit: req.query.limit
+        };
+        const items = getOverdueLoans(db, options);
+        res.json({
+            message: 'Overdue loans retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/overdue', handleOverdueLoans);
+router.get('/overdue/loans', handleOverdueLoans);
+
+// 8G: Collection Attention List
+const handleCollectionList = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = {
+            person_id: req.query.person_id,
+            account_id: req.query.account_id || req.query.loan_id,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period,
+            include_due: req.query.include_due === 'true' || req.query.include_due === '1',
+            limit: req.query.limit
+        };
+        const items = getPart8CollectionItems(db, options);
+        res.json({
+            message: 'Collection items retrieved successfully',
+            items: items,
+            data: items,
+            count: items.length
+        });
+    } catch (err) {
+        const statusCode = err.statusCode || 500;
+        res.status(statusCode).json({ error: err.message });
+    }
+};
+
+router.get('/collections', handleCollectionList);
+router.get('/collections/items', handleCollectionList);
+
+// ═══════════════════════════════════════════════════════════════
+// PART 9 — REPORTS API (9I)
+// ═══════════════════════════════════════════════════════════════
+const {
+    REPORT_TYPES,
+    generateReport,
+    generateLoanPortfolioReport,
+    generatePeopleReport,
+    generatePaymentReport,
+    generateInterestReport,
+    generateDueOverdueReport,
+    generateCollectionReport
+} = require('../services/reportService');
+
+const extractReportOptions = (req, explicitType = null) => ({
+    report_type: explicitType || req.params.report_type || req.query.report_type || req.query.type,
+    start_date: req.query.start_date || req.query.from || req.query.startDate,
+    end_date: req.query.end_date || req.query.to || req.query.endDate,
+    as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+    person_id: req.query.person_id || req.query.personId,
+    loan_id: req.query.loan_id || req.query.loanId || req.query.account_id || req.query.accountId,
+    status: req.query.status,
+    transaction_type: req.query.transaction_type || req.query.tx_type,
+    grace_period: req.query.grace_period,
+    page: req.query.page,
+    page_size: req.query.page_size || req.query.pageSize || req.query.limit
+});
+
+// Specific report endpoints
+router.get('/reports/loans', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generateLoanPortfolioReport(db, extractReportOptions(req, REPORT_TYPES.LOAN_PORTFOLIO));
+        res.json({ message: 'Loan portfolio report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/portfolio', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generateLoanPortfolioReport(db, extractReportOptions(req, REPORT_TYPES.LOAN_PORTFOLIO));
+        res.json({ message: 'Loan portfolio report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/people', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generatePeopleReport(db, extractReportOptions(req, REPORT_TYPES.PEOPLE));
+        res.json({ message: 'People report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/payments', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generatePaymentReport(db, extractReportOptions(req, REPORT_TYPES.PAYMENTS));
+        res.json({ message: 'Payment report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/transactions', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generatePaymentReport(db, extractReportOptions(req, REPORT_TYPES.PAYMENTS));
+        res.json({ message: 'Payment report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/interest', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generateInterestReport(db, extractReportOptions(req, REPORT_TYPES.INTEREST));
+        res.json({ message: 'Interest report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/due-overdue', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generateDueOverdueReport(db, extractReportOptions(req, REPORT_TYPES.DUE_OVERDUE));
+        res.json({ message: 'Due/overdue report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/collections', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generateCollectionReport(db, extractReportOptions(req, REPORT_TYPES.COLLECTION));
+        res.json({ message: 'Collection report generated successfully', data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+// Parameterized & unified report endpoints
+router.get('/reports/:report_type', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const report = generateReport(db, extractReportOptions(req));
+        res.json({ message: `${report.report_type} report generated successfully`, data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = extractReportOptions(req);
+        if (!options.report_type) {
+            return res.status(400).json({
+                error: `Report type parameter required (?type=... or ?report_type=...). Must be one of: ${Object.values(REPORT_TYPES).join(', ')}`
+            });
+        }
+        const report = generateReport(db, options);
+        res.json({ message: `${report.report_type} report generated successfully`, data: report, ...report });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PART 10 — PERSON STATEMENTS & PDF API (10F, 10H)
+// ═══════════════════════════════════════════════════════════════
+const { generatePersonStatement } = require('../services/statementService');
+const { generateStatementPdf, generateStatementFilename } = require('../services/pdfService');
+
+const handleStatementJson = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        let personId = req.params.person_id;
+        let loanId = req.query.loan_id || req.query.account_id;
+
+        // If called via /statements/loan/:loan_id, look up person_id
+        if (!personId && req.params.loan_id) {
+            loanId = req.params.loan_id;
+            const acc = queryOne(db, 'SELECT person_id FROM accounts WHERE id = ?', [loanId]);
+            if (!acc) {
+                return res.status(404).json({ error: `Loan #${loanId} not found` });
+            }
+            personId = acc.person_id;
+        }
+
+        const options = {
+            loan_id: loanId,
+            start_date: req.query.start_date || req.query.from,
+            end_date: req.query.end_date || req.query.to,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period
+        };
+
+        const statement = generatePersonStatement(db, personId, options);
+        res.json({
+            message: 'Person statement generated successfully',
+            success: true,
+            statement: statement,
+            data: statement,
+            ...statement
+        });
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+};
+
+const handleStatementPdf = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        let personId = req.params.person_id;
+        let loanId = req.query.loan_id || req.query.account_id;
+
+        if (!personId && req.params.loan_id) {
+            loanId = req.params.loan_id;
+            const acc = queryOne(db, 'SELECT person_id FROM accounts WHERE id = ?', [loanId]);
+            if (!acc) {
+                return res.status(404).json({ error: `Loan #${loanId} not found` });
+            }
+            personId = acc.person_id;
+        }
+
+        const options = {
+            loan_id: loanId,
+            start_date: req.query.start_date || req.query.from,
+            end_date: req.query.end_date || req.query.to,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period
+        };
+
+        const statement = generatePersonStatement(db, personId, options);
+        const pdfBuffer = await generateStatementPdf(statement);
+        const filename = generateStatementFilename(statement);
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Content-Length', pdfBuffer.length);
+        res.end(pdfBuffer);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+};
+
+router.get('/people/:person_id/statement', handleStatementJson);
+router.get('/people/:person_id/statement/pdf', handleStatementPdf);
+router.get('/statements/person/:person_id', handleStatementJson);
+router.get('/statements/person/:person_id/pdf', handleStatementPdf);
+router.get('/statements/loan/:loan_id', handleStatementJson);
+router.get('/statements/loan/:loan_id/pdf', handleStatementPdf);
+
+// ═══════════════════════════════════════════════════════════════
+// PART 11 — EXCEL EXPORT & BACKUP/RESTORE API (11B, 11G, 11H, 11J)
+// ═══════════════════════════════════════════════════════════════
+const {
+    exportPeople,
+    exportLoans,
+    exportTransactions,
+    exportInterest,
+    exportDueOverdue,
+    exportCollection,
+    exportReport,
+    exportPersonStatement
+} = require('../services/excelExportService');
+
+const {
+    createBackup,
+    validateBackup,
+    restoreBackup,
+    getBackupStatus,
+    generateBackupFilename
+} = require('../services/backupService');
+
+// Statement Excel Handler
+const handleStatementExcel = async (req, res) => {
+    try {
+        const db = await getDatabase();
+        let personId = req.params.person_id;
+        let loanId = req.query.loan_id || req.query.account_id;
+
+        if (!personId && req.params.loan_id) {
+            loanId = req.params.loan_id;
+            const acc = queryOne(db, 'SELECT person_id FROM accounts WHERE id = ?', [loanId]);
+            if (!acc) {
+                return res.status(404).json({ error: `Loan #${loanId} not found` });
+            }
+            personId = acc.person_id;
+        }
+
+        const options = {
+            loan_id: loanId,
+            start_date: req.query.start_date || req.query.from,
+            end_date: req.query.end_date || req.query.to,
+            as_of_date: req.query.as_of_date || req.query.current_date || req.query.date,
+            grace_period: req.query.grace_period
+        };
+
+        const excelResult = await exportPersonStatement(db, personId, options);
+        res.setHeader('Content-Type', excelResult.contentType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${excelResult.filename}"`);
+        res.setHeader('Content-Length', excelResult.length);
+        res.end(excelResult);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+};
+
+router.get('/people/:person_id/statement/excel', handleStatementExcel);
+router.get('/statements/person/:person_id/excel', handleStatementExcel);
+router.get('/statements/loan/:loan_id/excel', handleStatementExcel);
+
+// Report Excel Endpoints
+router.get('/reports/:report_type/excel', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = extractReportOptions(req);
+        const excelResult = await exportReport(db, options);
+        res.setHeader('Content-Type', excelResult.contentType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${excelResult.filename}"`);
+        res.setHeader('Content-Length', excelResult.length);
+        res.end(excelResult);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/reports/excel', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const options = extractReportOptions(req);
+        if (!options.report_type) {
+            return res.status(400).json({ error: 'Report type parameter required (?type=... or ?report_type=...)' });
+        }
+        const excelResult = await exportReport(db, options);
+        res.setHeader('Content-Type', excelResult.contentType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${excelResult.filename}"`);
+        res.setHeader('Content-Length', excelResult.length);
+        res.end(excelResult);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+// Domain Convenience Excel Endpoints
+router.get('/people/export/excel', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const excelResult = await exportPeople(db, req.query);
+        res.setHeader('Content-Type', excelResult.contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${excelResult.filename}"`);
+        res.setHeader('Content-Length', excelResult.length);
+        res.end(excelResult);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get(['/accounts/export/excel', '/loans/export/excel'], async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const excelResult = await exportLoans(db, req.query);
+        res.setHeader('Content-Type', excelResult.contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${excelResult.filename}"`);
+        res.setHeader('Content-Length', excelResult.length);
+        res.end(excelResult);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/transactions/export/excel', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const excelResult = await exportTransactions(db, req.query);
+        res.setHeader('Content-Type', excelResult.contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${excelResult.filename}"`);
+        res.setHeader('Content-Length', excelResult.length);
+        res.end(excelResult);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+// ─── Backup & Restore Endpoints (12M, 12E.3) ─────────────────
+router.get('/backup/export', requireStaffOrAdmin, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const backupPackage = createBackup(db);
+        const filename = generateBackupFilename(backupPackage.metadata.created_at);
+        const jsonStr = JSON.stringify(backupPackage, null, 2);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(jsonStr);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/backup/status', async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const status = getBackupStatus(db);
+        res.json(status);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/backup/validate', requireStaffOrAdmin, (req, res) => {
+    try {
+        const backupData = req.body.backup || req.body;
+        const validationResult = validateBackup(backupData);
+        res.json({ success: true, message: 'Backup validation passed', ...validationResult });
+    } catch (err) {
+        res.status(err.statusCode || 400).json({ success: false, error: err.message });
+    }
+});
+
+router.post('/backup/restore', requireAdmin, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const backupData = req.body.backup || req.body.data || req.body;
+        const confirm = req.body.confirm || req.body.confirmation;
+        const result = restoreBackup(db, backupData, { confirm });
+        res.json(result);
+    } catch (err) {
+        res.status(err.statusCode || 500).json({ success: false, error: err.message });
+    }
+});
+
 module.exports = router;
+
+
+
+
+
+
+

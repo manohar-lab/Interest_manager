@@ -1167,13 +1167,14 @@ function calculateTimelineInterest(db, accountOrId, startDate, endDate, options 
 // ─── Step 5I: Interest Outstanding & Payment Allocation ──────
 
 /**
- * Record an interest accrual / calculation into interest_records (Step 5I)
+ * Record an interest accrual / calculation (Step 5I)
  *
  * @param {Object} db - Database connection
  * @param {Object} data - { account_id, period_start, period_end, principal_basis, interest_rate, interest_amount, calculation_method }
+ * @param {Object} [options] - Optional source, actorId
  * @returns {Object} Created interest record
  */
-function recordInterest(db, data) {
+function recordInterest(db, data, options = {}) {
     const accountId = Number(data.account_id);
     if (!accountId || isNaN(accountId)) {
         const err = new Error('Valid account_id is required');
@@ -1202,6 +1203,18 @@ function recordInterest(db, data) {
         throw err;
     }
 
+    // Check for existing active interest record on the same period (§26, §54)
+    const existingActive = queryOne(db, `
+        SELECT * FROM interest_records
+        WHERE account_id = ? AND period_start = ? AND period_end = ? AND status != 'REVERSED'
+    `, [accountId, startNorm, endNorm]);
+
+    if (existingActive) {
+        const err = new Error(`An active interest record already exists for Account #${accountId} for period ${startNorm} to ${endNorm}`);
+        err.statusCode = 400;
+        throw err;
+    }
+
     // Convert amounts to integer paisa
     const amountPaisa = data.is_paisa === true || data.isPaisa === true
         ? Math.round(Number(data.interest_amount))
@@ -1219,22 +1232,81 @@ function recordInterest(db, data) {
 
     const rate = Number(data.interest_rate !== undefined ? data.interest_rate : account.interest_rate);
     const method = (data.calculation_method || account.calculation_method || 'SIMPLE_INTEREST').toUpperCase();
+    const source = (options && options.source) || data.source || 'MANUAL';
+    const actorId = (options && options.actorId) || data.actor_id || data.actorId || null;
+    const schedulerRunId = (options && (options.schedulerRunId || options.scheduler_run_id)) || data.scheduler_run_id || data.schedulerRunId || null;
+    const correctsRecordId = data.corrects_record_id || (options && options.correctsRecordId) || null;
 
-    db.run(`
-        INSERT INTO interest_records (
-            account_id, period_start, period_end, principal_basis,
-            interest_rate, interest_amount, paid_amount, calculation_method, status
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'PENDING')
-    `, [accountId, startNorm, endNorm, basisPaisa, rate, amountPaisa, method]);
+    const elapsedDays = calculateElapsedDays(startNorm, endNorm, 'ACTUAL_365');
+    const segments = Array.isArray(data.segments) && data.segments.length > 0
+        ? data.segments
+        : [{
+            segment_index: 1,
+            start_date: startNorm,
+            end_date: endNorm,
+            days: elapsedDays,
+            principal_paisa: basisPaisa,
+            principal_rupees: basisPaisa / 100,
+            interest_rate: rate,
+            interest_paisa: amountPaisa,
+            interest_rupees: amountPaisa / 100
+        }];
 
-    const lastId = queryOne(db, 'SELECT last_insert_rowid() as id');
-    const created = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [lastId.id]);
+    let created = null;
+    try {
+        db.run('BEGIN TRANSACTION');
 
-    db.run(
-        `INSERT INTO audit_logs (entity_type, entity_id, action, new_value)
-         VALUES ('INTEREST_RECORD', ?, 'CREATE', ?)`,
-        [created.id, JSON.stringify(created)]
-    );
+        db.run(`
+            INSERT INTO interest_records (
+                account_id, period_start, period_end, principal_basis,
+                interest_rate, interest_amount, paid_amount, calculation_method, status,
+                source, scheduler_run_id, corrects_record_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'PENDING', ?, ?, ?)
+        `, [accountId, startNorm, endNorm, basisPaisa, rate, amountPaisa, method, source, schedulerRunId, correctsRecordId]);
+
+        const lastId = queryOne(db, 'SELECT last_insert_rowid() as id');
+        created = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [lastId.id]);
+
+        if (correctsRecordId) {
+            db.run(`
+                UPDATE interest_records
+                SET corrected_by_record_id = ?
+                WHERE id = ?
+            `, [created.id, correctsRecordId]);
+        }
+
+        const auditPayload = {
+            event_type: 'INTEREST_RECORDED',
+            account_id: accountId,
+            interest_record_id: created.id,
+            source: source,
+            actor_id: actorId,
+            scheduler_run_id: schedulerRunId,
+            corrects_record_id: correctsRecordId,
+            period_start: startNorm,
+            period_end: endNorm,
+            principal_basis: basisPaisa,
+            principal_basis_rupees: basisPaisa / 100,
+            interest_rate: rate,
+            interest_amount: amountPaisa,
+            interest_amount_rupees: amountPaisa / 100,
+            calculation_method: method,
+            segments: segments,
+            total_elapsed_days: elapsedDays,
+            recorded_at: new Date().toISOString()
+        };
+
+        db.run(
+            `INSERT INTO audit_logs (entity_type, entity_id, action, new_value)
+             VALUES ('INTEREST_RECORD', ?, 'INTEREST_RECORDED', ?)`,
+            [created.id, JSON.stringify(auditPayload)]
+        );
+
+        db.run('COMMIT');
+    } catch (err) {
+        try { db.run('ROLLBACK'); } catch (_) {}
+        throw err;
+    }
 
     return {
         ...created,
@@ -1245,10 +1317,10 @@ function recordInterest(db, data) {
 }
 
 /**
- * Get derived interest balance and history for an account (Step 5I)
+ * Get derived interest balance and history for an account (Step 5I / 5N)
  *
  * Distinguishes:
- * - Interest Recorded: Total interest recorded in interest_records
+ * - Interest Recorded: Total interest recorded in interest_records (excluding REVERSED records)
  * - Interest Paid: Total money received as interest (INTEREST_RECEIVED transactions)
  * - Interest Outstanding: Recorded minus Paid (never negative)
  *
@@ -1271,31 +1343,25 @@ function getAccountInterestBalance(db, accountId) {
         throw err;
     }
 
-    // 1. Total interest recorded
+    // 1. Total interest recorded in active interest_records (excluding REVERSED records §17, §34)
     const recRow = queryOne(db, `
         SELECT COALESCE(SUM(interest_amount), 0) as total_recorded,
                COUNT(*) as record_count
         FROM interest_records
-        WHERE account_id = ?
+        WHERE account_id = ? AND status != 'REVERSED'
     `, [accId]);
-    const recordedPaisa = Number(recRow?.total_recorded || 0);
-    const recordCount = Number(recRow?.record_count || 0);
+    const recordedPaisa = recRow ? recRow.total_recorded : 0;
+    const recordCount = recRow ? recRow.record_count : 0;
 
-    // 2. Total interest paid from transactions
-    const paidRow = queryOne(db, `
+    // 2. Total interest paid from INTEREST_RECEIVED transactions (in paisa)
+    const txRow = queryOne(db, `
         SELECT COALESCE(SUM(amount), 0) as total_paid
         FROM transactions
         WHERE account_id = ? AND transaction_type = 'INTEREST_RECEIVED'
     `, [accId]);
-    const paidPaisa = Number(paidRow?.total_paid || 0);
+    const paidPaisa = txRow ? txRow.total_paid : 0;
 
-    // 3. Defensive check against negative balance
-    if (recordCount > 0 && paidPaisa > recordedPaisa) {
-        const err = new Error(`Data integrity error: Account #${accId} has interest paid (₹${paidPaisa / 100}) exceeding recorded interest (₹${recordedPaisa / 100})`);
-        err.statusCode = 400;
-        throw err;
-    }
-
+    // 3. Interest outstanding = max(0, recorded - paid)
     const outstandingPaisa = Math.max(0, recordedPaisa - paidPaisa);
 
     function formatDmy(d) {
@@ -1305,19 +1371,20 @@ function getAccountInterestBalance(db, accountId) {
         return d;
     }
 
-    // 4. Fetch all individual interest records for this account
-    const records = queryAll(db, `
-        SELECT r.*,
-               (r.interest_amount - r.paid_amount) as outstanding_amount
-        FROM interest_records r
-        WHERE r.account_id = ?
-        ORDER BY r.period_start ASC, r.id ASC
-    `, [accId]).map(r => ({
+    // 4. Detailed record history
+    const rawRecords = queryAll(db, `
+        SELECT * FROM interest_records
+        WHERE account_id = ?
+        ORDER BY period_start ASC, id ASC
+    `, [accId]);
+
+    const records = rawRecords.map(r => ({
         id: r.id,
         account_id: r.account_id,
         period_start: r.period_start,
+        period_start_formatted: formatDmy(r.period_start),
         period_end: r.period_end,
-        period_formatted: `${formatDmy(r.period_start)} – ${formatDmy(r.period_end)}`,
+        period_end_formatted: formatDmy(r.period_end),
         principal_basis: r.principal_basis / 100,
         principal_basis_paisa: r.principal_basis,
         interest_rate: r.interest_rate,
@@ -1325,10 +1392,18 @@ function getAccountInterestBalance(db, accountId) {
         interest_amount_paisa: r.interest_amount,
         paid_amount: r.paid_amount / 100,
         paid_amount_paisa: r.paid_amount,
-        outstanding_amount: (r.interest_amount - r.paid_amount) / 100,
-        outstanding_amount_paisa: (r.interest_amount - r.paid_amount),
+        outstanding_amount: r.status === 'REVERSED' ? 0 : ((r.interest_amount - r.paid_amount) / 100),
+        outstanding_amount_paisa: r.status === 'REVERSED' ? 0 : (r.interest_amount - r.paid_amount),
         calculation_method: r.calculation_method,
         status: r.status,
+        source: r.source || 'MANUAL',
+        scheduler_run_id: r.scheduler_run_id || null,
+        reversal_reason: r.reversal_reason || null,
+        reversed_at: r.reversed_at || null,
+        reversal_actor_id: r.reversal_actor_id || null,
+        reversal_source: r.reversal_source || null,
+        corrects_record_id: r.corrects_record_id || null,
+        corrected_by_record_id: r.corrected_by_record_id || null,
         created_at: r.created_at
     }));
 
@@ -1337,16 +1412,20 @@ function getAccountInterestBalance(db, accountId) {
         account_id: accId,
         hasRecords: recordCount > 0,
         recordCount: recordCount,
+        record_count: recordCount,
         interestRecorded: recordedPaisa / 100,
         interest_recorded: recordedPaisa / 100,
+        total_recorded: recordedPaisa / 100,
         interestRecordedPaisa: recordedPaisa,
         interest_recorded_paisa: recordedPaisa,
         interestPaid: paidPaisa / 100,
         interest_paid: paidPaisa / 100,
+        total_paid: paidPaisa / 100,
         interestPaidPaisa: paidPaisa,
         interest_paid_paisa: paidPaisa,
         interestOutstanding: outstandingPaisa / 100,
         interest_outstanding: outstandingPaisa / 100,
+        total_outstanding: outstandingPaisa / 100,
         interestOutstandingPaisa: outstandingPaisa,
         interest_outstanding_paisa: outstandingPaisa,
         records: records
@@ -1407,18 +1486,18 @@ function allocateInterestPaymentToRecords(db, accountId, txId, interestAmountPai
 }
 
 /**
- * Step 5J: Automatic Interest Accrual Service
+ * Step 5J / 5M / 5N: Automatic Interest Accrual Service
  *
  * Automatically calculates timeline-based interest using Step 5F and persists it
  * into interest_records using Step 5H/5I mechanisms with strict duplicate protection,
- * concurrency safety, and zero-interest handling.
+ * concurrency safety, Step 5M audit logging, and Step 5N reversal compatibility.
  *
  * @param {Object} db - SQLite database instance
  * @param {number|string} accountId - Account ID
  * @param {string} startDate - Start date (YYYY-MM-DD or DD/MM/YYYY)
  * @param {string} endDate - End date (YYYY-MM-DD or DD/MM/YYYY)
- * @param {Object} [options] - Additional options (e.g. dayCountConvention, in-memory transactions override)
- * @returns {Object} Structured result { status, accountId, periodStart, periodEnd, interestRecordId, interestAmount, interestAmountPaisa, alreadyRecorded, calculation }
+ * @param {Object} [options] - Additional options (e.g. source, schedulerRunId, correctsRecordId)
+ * @returns {Object} Structured result
  */
 function accrueInterest(db, accountId, startDate, endDate, options = {}) {
     const accId = Number(accountId);
@@ -1462,10 +1541,10 @@ function accrueInterest(db, accountId, startDate, endDate, options = {}) {
         throw err;
     }
 
-    // 1. Duplicate Check: check if interest is already recorded for this account and period
+    // 1. Duplicate Check: check if active interest is already recorded for this account and period (§26, §54)
     const existingRecord = queryOne(db, `
         SELECT * FROM interest_records
-        WHERE account_id = ? AND period_start = ? AND period_end = ?
+        WHERE account_id = ? AND period_start = ? AND period_end = ? AND status != 'REVERSED'
     `, [accId, startNorm, endNorm]);
 
     if (existingRecord) {
@@ -1487,7 +1566,6 @@ function accrueInterest(db, accountId, startDate, endDate, options = {}) {
     const calcResult = calculateTimelineInterest(db, accId, startNorm, endNorm, options);
 
     // 3. Zero Interest Handling:
-    // If 0 elapsed days or 0 total interest (e.g. 0 principal or same start/end date)
     if (calcResult.totalElapsedDays === 0 || calcResult.totalInterestPaisa === 0) {
         return {
             status: 'ZERO_INTEREST',
@@ -1505,13 +1583,17 @@ function accrueInterest(db, accountId, startDate, endDate, options = {}) {
 
     // 4. Persistence with transaction & concurrency safety
     let createdRecord = null;
+    const source = options.source || 'AUTOMATIC';
+    const schedulerRunId = options.schedulerRunId || options.scheduler_run_id || options.runId || null;
+    const correctsRecordId = options.correctsRecordId || options.corrects_record_id || null;
+
     try {
         db.run('BEGIN TRANSACTION');
 
         // Re-check duplicate inside transaction lock
         const freshExisting = queryOne(db, `
             SELECT * FROM interest_records
-            WHERE account_id = ? AND period_start = ? AND period_end = ?
+            WHERE account_id = ? AND period_start = ? AND period_end = ? AND status != 'REVERSED'
         `, [accId, startNorm, endNorm]);
 
         if (freshExisting) {
@@ -1537,36 +1619,67 @@ function accrueInterest(db, accountId, startDate, endDate, options = {}) {
         db.run(`
             INSERT INTO interest_records (
                 account_id, period_start, period_end, principal_basis,
-                interest_rate, interest_amount, paid_amount, calculation_method, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, 'SIMPLE_INTEREST', 'PENDING')
-        `, [accId, startNorm, endNorm, basisPaisa, rate, interestAmountPaisa]);
+                interest_rate, interest_amount, paid_amount, calculation_method, status,
+                source, scheduler_run_id, corrects_record_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 'SIMPLE_INTEREST', 'PENDING', ?, ?, ?)
+        `, [accId, startNorm, endNorm, basisPaisa, rate, interestAmountPaisa, source, schedulerRunId, correctsRecordId]);
 
         const rowid = queryOne(db, 'SELECT last_insert_rowid() as id');
         createdRecord = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [rowid.id]);
 
-        // Audit log
-        db.run(`
-            INSERT INTO audit_logs (entity_type, entity_id, action, new_value)
-            VALUES ('INTEREST_RECORD', ?, 'AUTO_ACCRUE', ?)
-        `, [createdRecord.id, JSON.stringify({
+        if (correctsRecordId) {
+            db.run(`
+                UPDATE interest_records
+                SET corrected_by_record_id = ?
+                WHERE id = ?
+            `, [createdRecord.id, correctsRecordId]);
+        }
+
+        // Format calculation segments for rich audit breakdown (Step 5M)
+        const formattedSegments = (calcResult.segments || []).map((seg, idx) => ({
+            segment_index: idx + 1,
+            start_date: seg.startDate || seg.start_date,
+            end_date: seg.endDate || seg.end_date,
+            days: seg.days !== undefined ? seg.days : (seg.elapsedDays || 0),
+            principal_paisa: seg.principalPaisa !== undefined ? seg.principalPaisa : (seg.principal_paisa || Math.round((seg.principal || 0) * 100)),
+            principal_rupees: seg.principal !== undefined ? seg.principal : ((seg.principalPaisa || seg.principal_paisa || 0) / 100),
+            interest_rate: seg.rate !== undefined ? seg.rate : (seg.interest_rate || calcResult.annualRate),
+            interest_paisa: seg.interestPaisa !== undefined ? seg.interestPaisa : (seg.interest_paisa || Math.round((seg.interest || 0) * 100)),
+            interest_rupees: seg.interest !== undefined ? seg.interest : ((seg.interestPaisa || seg.interest_paisa || 0) / 100)
+        }));
+
+        const auditPayload = {
+            event_type: 'INTEREST_RECORDED',
             account_id: accId,
+            interest_record_id: createdRecord.id,
+            source: source,
+            scheduler_run_id: schedulerRunId,
+            corrects_record_id: correctsRecordId,
             period_start: startNorm,
             period_end: endNorm,
             principal_basis: basisPaisa,
+            principal_basis_rupees: basisPaisa / 100,
             interest_rate: rate,
             interest_amount: interestAmountPaisa,
-            segments: calcResult.segments?.length || 0,
-            total_elapsed_days: calcResult.totalElapsedDays
-        })]);
+            interest_amount_rupees: interestAmountPaisa / 100,
+            calculation_method: 'SIMPLE_INTEREST',
+            segments: formattedSegments,
+            total_elapsed_days: calcResult.totalElapsedDays,
+            recorded_at: new Date().toISOString()
+        };
+
+        db.run(`
+            INSERT INTO audit_logs (entity_type, entity_id, action, new_value)
+            VALUES ('INTEREST_RECORD', ?, 'INTEREST_RECORDED', ?)
+        `, [createdRecord.id, JSON.stringify(auditPayload)]);
 
         db.run('COMMIT');
     } catch (err) {
         try { db.run('ROLLBACK'); } catch (_) {}
-        // Check for unique constraint violation (concurrent insertion)
         if (err.message && err.message.includes('UNIQUE constraint failed')) {
             const fallback = queryOne(db, `
                 SELECT * FROM interest_records
-                WHERE account_id = ? AND period_start = ? AND period_end = ?
+                WHERE account_id = ? AND period_start = ? AND period_end = ? AND status != 'REVERSED'
             `, [accId, startNorm, endNorm]);
             if (fallback) {
                 return {
@@ -1601,6 +1714,340 @@ function accrueInterest(db, accountId, startDate, endDate, options = {}) {
     };
 }
 
+// ─── Step 5N: Interest Correction & Reversal ──────────────────
+/**
+ * Reverses a recorded interest entry.
+ *
+ * Core Rules:
+ * - Original record remains immutable and is marked REVERSED (§2, §5, §6)
+ * - Requires a non-empty reason (§7, §8)
+ * - Full reversal only (§4)
+ * - Rejected if paid_amount > 0 (§18, §20, §21)
+ * - Double-reversal and concurrent reversal protection (§15, §16)
+ * - Atomic transaction with INTEREST_REVERSED audit log (§11, §14)
+ *
+ * @param {Object} db - SQLite database instance
+ * @param {number|string} recordId - Interest record ID
+ * @param {Object|string} options - Options or reason string
+ * @returns {Object} Structured reversal result
+ */
+function reverseInterest(db, recordId, options = {}) {
+    const recId = Number(recordId);
+    if (!recId || isNaN(recId)) {
+        const err = new Error('Valid interest record ID is required');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const rawReason = typeof options === 'string' ? options : (options && options.reason);
+    const reason = rawReason && typeof rawReason === 'string' ? rawReason.trim() : '';
+
+    if (!reason || reason.length === 0) {
+        const err = new Error('Reversal reason is required');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    if (reason.length > 500) {
+        const err = new Error('Reversal reason must be 500 characters or less');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const record = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [recId]);
+    if (!record) {
+        const err = new Error(`Interest record #${recId} not found`);
+        err.statusCode = 404;
+        throw err;
+    }
+
+    // Double-reversal protection (§15, §41)
+    if (record.status === 'REVERSED') {
+        const err = new Error(`Interest record #${recId} has already been reversed`);
+        err.statusCode = 400;
+        throw err;
+    }
+
+    // Payment protection (§18, §20, §21, §43, §44)
+    if (record.paid_amount > 0) {
+        const err = new Error('This interest record has associated payments and cannot be fully reversed.');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const reversedAt = new Date().toISOString();
+    const source = (options && options.source) || 'MANUAL';
+    const actorId = (options && (options.actor_id || options.actorId)) || null;
+
+    let updatedRecord = null;
+    try {
+        db.run('BEGIN TRANSACTION');
+
+        // Concurrency double-check inside transaction (§16, §42)
+        const lockedRecord = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [recId]);
+        if (lockedRecord.status === 'REVERSED') {
+            db.run('ROLLBACK');
+            const err = new Error(`Interest record #${recId} has already been reversed`);
+            err.statusCode = 400;
+            throw err;
+        }
+
+        if (lockedRecord.paid_amount > 0) {
+            db.run('ROLLBACK');
+            const err = new Error('This interest record has associated payments and cannot be fully reversed.');
+            err.statusCode = 400;
+            throw err;
+        }
+
+        db.run(`
+            UPDATE interest_records
+            SET status = 'REVERSED',
+                reversal_reason = ?,
+                reversed_at = ?,
+                reversal_actor_id = ?,
+                reversal_source = ?
+            WHERE id = ? AND status != 'REVERSED'
+        `, [reason, reversedAt, actorId, source, recId]);
+
+        updatedRecord = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [recId]);
+
+        const auditPayload = {
+            event_type: 'INTEREST_REVERSED',
+            account_id: record.account_id,
+            interest_record_id: record.id,
+            source: source,
+            actor_id: actorId,
+            reason: reason,
+            reversed_at: reversedAt,
+            original_amount: record.interest_amount,
+            original_amount_rupees: record.interest_amount / 100,
+            period_start: record.period_start,
+            period_end: record.period_end,
+            principal_basis: record.principal_basis,
+            principal_basis_rupees: record.principal_basis / 100,
+            timestamp: reversedAt
+        };
+
+        db.run(`
+            INSERT INTO audit_logs (entity_type, entity_id, action, new_value)
+            VALUES ('INTEREST_RECORD', ?, 'INTEREST_REVERSED', ?)
+        `, [record.id, JSON.stringify(auditPayload)]);
+
+        db.run('COMMIT');
+    } catch (err) {
+        try { db.run('ROLLBACK'); } catch (_) {}
+        throw err;
+    }
+
+    saveDatabase();
+
+    return {
+        success: true,
+        message: 'Interest reversed successfully',
+        ...updatedRecord,
+        record: {
+            ...updatedRecord,
+            interest_amount_rupees: updatedRecord.interest_amount / 100,
+            paid_amount_rupees: updatedRecord.paid_amount / 100,
+            outstanding_amount_rupees: 0
+        },
+        reversal: {
+            reversed_at: reversedAt,
+            reason: reason,
+            actor_id: actorId,
+            source: source,
+            original_amount_rupees: record.interest_amount / 100
+        }
+    };
+}
+
+/**
+ * Retrieves the full correction lineage chain for an interest record (§28, §33).
+ * Traces: Original Record → Reversal Record → Corrected Record.
+ *
+ * @param {Object} db - SQLite database instance
+ * @param {number|string} recordId - Interest record ID
+ * @returns {Object} Structured correction history
+ */
+function getInterestCorrectionChain(db, recordId) {
+    const recId = Number(recordId);
+    if (!recId || isNaN(recId)) {
+        const err = new Error('Valid interest record ID is required');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const current = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [recId]);
+    if (!current) {
+        const err = new Error(`Interest record #${recId} not found`);
+        err.statusCode = 404;
+        throw err;
+    }
+
+    // Traverse backwards to root original record
+    let root = current;
+    while (root.corrects_record_id) {
+        const parent = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [root.corrects_record_id]);
+        if (!parent) break;
+        root = parent;
+    }
+
+    // Traverse forward from root through all corrections
+    const chain = [];
+    let ptr = root;
+    while (ptr) {
+        const auditLog = queryOne(db, `
+            SELECT * FROM audit_logs
+            WHERE entity_type = 'INTEREST_RECORD' AND entity_id = ?
+            ORDER BY id ASC
+        `, [ptr.id]);
+
+        let parsedAudit = null;
+        if (auditLog && auditLog.new_value) {
+            try { parsedAudit = JSON.parse(auditLog.new_value); } catch (_) {}
+        }
+
+        chain.push({
+            id: ptr.id,
+            account_id: ptr.account_id,
+            type: ptr.corrects_record_id ? 'CORRECTION' : 'ORIGINAL',
+            period_start: ptr.period_start,
+            period_end: ptr.period_end,
+            interest_amount_rupees: ptr.interest_amount / 100,
+            interest_amount_paisa: ptr.interest_amount,
+            status: ptr.status,
+            reversal_reason: ptr.reversal_reason,
+            reversed_at: ptr.reversed_at,
+            reversal_actor_id: ptr.reversal_actor_id,
+            corrects_record_id: ptr.corrects_record_id,
+            corrected_by_record_id: ptr.corrected_by_record_id,
+            created_at: ptr.created_at,
+            audit: parsedAudit
+        });
+
+        if (ptr.corrected_by_record_id) {
+            ptr = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [ptr.corrected_by_record_id]);
+        } else {
+            break;
+        }
+    }
+
+    return {
+        recordId: recId,
+        account_id: root.account_id,
+        accountId: root.account_id,
+        chainLength: chain.length,
+        total_chain_length: chain.length,
+        hasReversal: chain.some(c => c.status === 'REVERSED'),
+        chain: chain
+    };
+}
+
+// ─── Step 5M: Audit Query Helpers ────────────────────────────
+function getInterestRecordAudit(db, recordId) {
+    const recId = Number(recordId);
+    if (!recId || isNaN(recId)) {
+        const err = new Error('Valid interest record ID is required');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const record = queryOne(db, `
+        SELECT r.*, a.direction, a.interest_frequency, p.name as person_name
+        FROM interest_records r
+        JOIN accounts a ON r.account_id = a.id
+        JOIN people p ON a.person_id = p.id
+        WHERE r.id = ?
+    `, [recId]);
+
+    if (!record) {
+        const err = new Error(`Interest record #${recId} not found`);
+        err.statusCode = 404;
+        throw err;
+    }
+
+    const auditLog = queryOne(db, `
+        SELECT * FROM audit_logs
+        WHERE entity_type = 'INTEREST_RECORD' AND entity_id = ?
+          AND action IN ('INTEREST_RECORDED', 'INTEREST_REVERSED', 'AUTO_ACCRUE', 'CREATE')
+        ORDER BY id DESC
+        LIMIT 1
+    `, [recId]);
+
+    if (!auditLog || !auditLog.new_value) {
+        return {
+            record: {
+                ...record,
+                interest_amount_rupees: record.interest_amount / 100,
+                principal_basis_rupees: record.principal_basis / 100,
+                paid_amount_rupees: record.paid_amount / 100,
+                outstanding_amount_rupees: record.status === 'REVERSED' ? 0 : ((record.interest_amount - record.paid_amount) / 100)
+            },
+            audit: null,
+            is_legacy: true,
+            message: 'Historical record — audit data unavailable'
+        };
+    }
+
+    let parsedAudit = {};
+    try {
+        parsedAudit = JSON.parse(auditLog.new_value);
+    } catch (_) {
+        parsedAudit = { raw: auditLog.new_value };
+    }
+
+    return {
+        record: {
+            ...record,
+            interest_amount_rupees: record.interest_amount / 100,
+            principal_basis_rupees: record.principal_basis / 100,
+            paid_amount_rupees: record.paid_amount / 100,
+            outstanding_amount_rupees: record.status === 'REVERSED' ? 0 : ((record.interest_amount - record.paid_amount) / 100)
+        },
+        audit: {
+            event_id: auditLog.id,
+            action: auditLog.action,
+            timestamp: auditLog.timestamp,
+            source: parsedAudit.source || (auditLog.action === 'AUTO_ACCRUE' ? 'AUTOMATIC' : 'MANUAL'),
+            scheduler_run_id: parsedAudit.scheduler_run_id || null,
+            actor_id: parsedAudit.actor_id || null,
+            account_id: parsedAudit.account_id || record.account_id,
+            interest_record_id: parsedAudit.interest_record_id || record.id,
+            period_start: parsedAudit.period_start || record.period_start,
+            period_end: parsedAudit.period_end || record.period_end,
+            principal_basis: parsedAudit.principal_basis || record.principal_basis,
+            principal_basis_rupees: (parsedAudit.principal_basis || record.principal_basis) / 100,
+            interest_rate: parsedAudit.interest_rate !== undefined ? parsedAudit.interest_rate : record.interest_rate,
+            interest_amount: parsedAudit.interest_amount || record.interest_amount,
+            interest_amount_rupees: (parsedAudit.interest_amount || record.interest_amount) / 100,
+            calculation_method: parsedAudit.calculation_method || record.calculation_method,
+            total_elapsed_days: parsedAudit.total_elapsed_days || null,
+            segments: parsedAudit.segments || [],
+            recorded_at: parsedAudit.recorded_at || auditLog.timestamp,
+            reason: parsedAudit.reason || record.reversal_reason || null,
+            reversed_at: parsedAudit.reversed_at || record.reversed_at || null
+        },
+        is_legacy: false
+    };
+}
+
+function getAccountInterestAuditHistory(db, accountId) {
+    const accId = Number(accountId);
+    if (!accId || isNaN(accId)) {
+        const err = new Error('Valid account_id is required');
+        err.statusCode = 400;
+        throw err;
+    }
+
+    const records = queryAll(db, `
+        SELECT id FROM interest_records
+        WHERE account_id = ?
+        ORDER BY period_start ASC, id ASC
+    `, [accId]);
+
+    return records.map(r => getInterestRecordAudit(db, r.id));
+}
+
 module.exports = {
     SUPPORTED_CALCULATION_METHODS,
     SUPPORTED_FREQUENCIES,
@@ -1618,12 +2065,16 @@ module.exports = {
     calculateAccountInterest,
     buildPrincipalTimeline,
     calculateTimelineInterest,
+    validateCalculationInput,
+    prepareInterestCalculation,
+    calculateInterest,
+    calculateSimpleInterest,
     recordInterest,
     getAccountInterestBalance,
     allocateInterestPaymentToRecords,
     accrueInterest,
-    validateCalculationInput,
-    prepareInterestCalculation,
-    calculateInterest,
-    calculateSimpleInterest
+    getInterestRecordAudit,
+    getAccountInterestAuditHistory,
+    reverseInterest,
+    getInterestCorrectionChain
 };

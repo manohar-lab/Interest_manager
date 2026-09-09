@@ -9,10 +9,17 @@
     "db:init": "node db/init.js",
     "test": "node tests/db-tests.js"
   },
-  "keywords": ["finance", "interest", "lending", "management"],
+  "keywords": [
+    "finance",
+    "interest",
+    "lending",
+    "management"
+  ],
   "license": "ISC",
   "dependencies": {
+    "exceljs": "^4.4.0",
     "express": "^5.1.0",
+    "pdfkit": "^0.20.2",
     "sql.js": "^1.12.0"
   }
 }

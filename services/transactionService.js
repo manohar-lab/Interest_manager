@@ -351,14 +351,65 @@ async function allocatePayment(db, data, idempotencyKey = null) {
 
     // Convert amounts to paisa
     const totalPaisa = Math.round(Number(data.total_amount !== undefined ? data.total_amount : data.amount) * 100);
-    const interestPaisa = Math.round(Number(data.interest_amount !== undefined ? data.interest_amount : 0) * 100);
-    const principalPaisa = Math.round(Number(data.principal_amount !== undefined ? data.principal_amount : 0) * 100);
-
     if (isNaN(totalPaisa) || totalPaisa <= 0) {
         const err = new Error('Total payment amount must be greater than zero');
         err.statusCode = 400;
         throw err;
     }
+
+    // Step 6G: Support targeted interest_record_id validation & capacity check
+    let targetRecord = null;
+    let targetRecordOutstandingPaisa = 0;
+    if (data.interest_record_id) {
+        const recId = Number(data.interest_record_id);
+        targetRecord = queryOne(db, 'SELECT * FROM interest_records WHERE id = ?', [recId]);
+        if (!targetRecord) {
+            const err = new Error(`Interest record #${recId} not found`);
+            err.statusCode = 404;
+            throw err;
+        }
+        if (Number(targetRecord.account_id) !== accountId) {
+            const err = new Error(`Interest record #${recId} belongs to Account #${targetRecord.account_id}, not Account #${accountId}`);
+            err.statusCode = 400;
+            throw err;
+        }
+        if (targetRecord.status === 'REVERSED') {
+            const err = new Error(`Cannot allocate payment to reversed interest record #${recId}`);
+            err.statusCode = 400;
+            throw err;
+        }
+        targetRecordOutstandingPaisa = Math.max(0, targetRecord.interest_amount - (targetRecord.paid_amount || 0));
+        if (targetRecord.status === 'PAID' || targetRecordOutstandingPaisa <= 0) {
+            const err = new Error(`Interest record #${recId} is already fully settled (outstanding: ₹0.00)`);
+            err.statusCode = 400;
+            throw err;
+        }
+    }
+
+    let interestPaisa = data.interest_amount !== undefined ? Math.round(Number(data.interest_amount) * 100) : null;
+    let principalPaisa = data.principal_amount !== undefined ? Math.round(Number(data.principal_amount) * 100) : null;
+
+    // Step 6G: Auto-allocation & Overpayment Cascading
+    const interestBalance = getAccountInterestBalance(db, accountId);
+    const maxAvailableInterest = targetRecord ? targetRecordOutstandingPaisa : interestBalance.interestOutstandingPaisa;
+
+    if (data.auto_allocate === true || (interestPaisa === null && principalPaisa === null)) {
+        interestPaisa = Math.min(totalPaisa, maxAvailableInterest);
+        principalPaisa = totalPaisa - interestPaisa;
+    } else if (data.cascade_overpayment === true || (data.interest_record_id && principalPaisa === null)) {
+        if (interestPaisa === null) interestPaisa = totalPaisa;
+        if (interestPaisa > maxAvailableInterest) {
+            const excess = interestPaisa - maxAvailableInterest;
+            interestPaisa = maxAvailableInterest;
+            principalPaisa = (principalPaisa || 0) + excess;
+        } else {
+            principalPaisa = totalPaisa - interestPaisa;
+        }
+    } else {
+        if (interestPaisa === null) interestPaisa = 0;
+        if (principalPaisa === null) principalPaisa = 0;
+    }
+
     if (isNaN(interestPaisa) || interestPaisa < 0) {
         const err = new Error('Interest portion must be greater than or equal to zero');
         err.statusCode = 400;
@@ -389,15 +440,21 @@ async function allocatePayment(db, data, idempotencyKey = null) {
         throw err;
     }
 
-    // Step 5I: Interest cannot exceed current outstanding interest (if interest records exist)
-    const interestBalance = getAccountInterestBalance(db, accountId);
+    // Step 5I / 6G: Interest cannot exceed current outstanding interest (if interest records exist)
     if (interestBalance.hasRecords) {
         if (interestPaisa > 0 && interestBalance.interestOutstandingPaisa === 0) {
             const err = new Error(`Cannot allocate interest payment: Account #${accountId} has ₹0 outstanding interest`);
             err.statusCode = 400;
             throw err;
         }
-        if (interestPaisa > interestBalance.interestOutstandingPaisa) {
+        if (targetRecord && interestPaisa > targetRecordOutstandingPaisa) {
+            const maxInterestRupees = targetRecordOutstandingPaisa / 100;
+            const interestRupees = interestPaisa / 100;
+            const err = new Error(`Interest allocation (₹${interestRupees}) cannot exceed target interest record #${targetRecord.id} outstanding (₹${maxInterestRupees})`);
+            err.statusCode = 400;
+            throw err;
+        }
+        if (!targetRecord && interestPaisa > interestBalance.interestOutstandingPaisa) {
             const maxInterestRupees = interestBalance.interestOutstandingPaisa / 100;
             const interestRupees = interestPaisa / 100;
             const err = new Error(`Interest allocation (₹${interestRupees}) cannot exceed current outstanding interest (₹${maxInterestRupees})`);
@@ -488,8 +545,18 @@ async function allocatePayment(db, data, idempotencyKey = null) {
 
             createdTransactions.push(interestTx);
 
-            // Step 5I: Associate with interest_records in FIFO order
-            if (freshInterestBalance.hasRecords) {
+            // Step 5I / 6G: Associate with interest_records
+            if (data.interest_record_id) {
+                const { allocatePaymentToInterestRecord } = require('./interestPaymentService');
+                allocatePaymentToInterestRecord(db, {
+                    interest_record_id: data.interest_record_id,
+                    account_id: accountId,
+                    transaction_id: interestTx.id,
+                    payment_id: paymentId,
+                    amount: interestPaisa,
+                    is_paisa: true
+                });
+            } else if (freshInterestBalance.hasRecords) {
                 allocateInterestPaymentToRecords(db, accountId, interestTx.id, interestPaisa);
             }
         }

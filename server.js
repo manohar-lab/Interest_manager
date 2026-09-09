@@ -2,13 +2,15 @@ const express = require('express');
 const path = require('path');
 const { getDatabase, saveDatabase, closeDatabase } = require('./db/connection');
 const apiRoutes = require('./routes/api');
+const { registerScheduler, stopScheduler } = require('./services/schedulerService');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ─── Middleware ──────────────────────────────────────────────
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
 
 // ─── Static files ────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
@@ -29,11 +31,13 @@ setInterval(() => {
 // ─── Graceful shutdown ──────────────────────────────────────
 process.on('SIGINT', () => {
     console.log('\nShutting down gracefully...');
+    stopScheduler();
     closeDatabase();
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
+    stopScheduler();
     closeDatabase();
     process.exit(0);
 });
@@ -54,6 +58,11 @@ async function start() {
             console.log(`\n  ✦ Interest Manager running at http://localhost:${PORT}`);
             console.log(`  ✦ Database: ${tableCount} tables connected`);
             console.log(`  ✦ Press Ctrl+C to stop\n`);
+
+            // ─── Step 5K: Register automatic interest accrual scheduler ──
+            // Runs once 10s after startup, then every 24 hours.
+            // Singleton guard in registerScheduler() prevents double-registration (§26).
+            registerScheduler(db);
         });
     } catch (err) {
         console.error('  ✗ Startup failed:', err.message);

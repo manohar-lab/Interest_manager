@@ -149,7 +149,7 @@ async function runTests() {
         const key = 'idem-test-key-999';
         const payload = {
             account_id: acc1.id,
-            transaction_type: 'MONEY_RECEIVED',
+            transaction_type: 'MONEY_LENT',
             amount: 500,
             payment_method: 'BANK_TRANSFER',
             transaction_date: '2026-09-05'

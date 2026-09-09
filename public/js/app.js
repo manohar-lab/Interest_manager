@@ -126,9 +126,77 @@
         }
     }
 
+    // ─── Authentication & Session State (Part 12) ───────────
+    let authToken = sessionStorage.getItem('im_auth_token') || null;
+    let currentUser = null;
+    try {
+        currentUser = JSON.parse(sessionStorage.getItem('im_current_user') || 'null');
+    } catch (_) {}
+
+    function setAuthSession(token, user) {
+        authToken = token;
+        currentUser = user;
+        if (token) {
+            sessionStorage.setItem('im_auth_token', token);
+            sessionStorage.setItem('im_current_user', JSON.stringify(user));
+        } else {
+            sessionStorage.removeItem('im_auth_token');
+            sessionStorage.removeItem('im_current_user');
+        }
+        updateHeaderAuthUI();
+    }
+
+    function getAuthHeaders(customHeaders = {}) {
+        const headers = { ...customHeaders };
+        if (authToken) {
+            headers['Authorization'] = `Bearer ${authToken}`;
+        }
+        return headers;
+    }
+
+    function handleUnauthorized() {
+        if (authToken) {
+            setAuthSession(null, null);
+            showToast('Session expired. Please sign in again.', 'warning');
+            renderLogin();
+        }
+    }
+
+    function updateHeaderAuthUI() {
+        const notifBtn = document.getElementById('btn-notifications');
+        const secBtn = document.getElementById('btn-security-settings');
+        const userWidget = document.getElementById('user-profile-widget');
+        const userNameSpan = document.getElementById('user-display-name');
+        const userRoleBadge = document.getElementById('user-role-badge');
+        const fab = document.getElementById('fab-add');
+
+        if (authToken && currentUser) {
+            if (notifBtn) notifBtn.style.display = 'flex';
+            if (secBtn) secBtn.style.display = 'flex';
+            if (userWidget) userWidget.style.display = 'flex';
+            if (userNameSpan) userNameSpan.textContent = currentUser.username;
+            if (userRoleBadge) {
+                userRoleBadge.textContent = currentUser.role;
+                userRoleBadge.className = `role-badge role-${(currentUser.role || 'viewer').toLowerCase()}`;
+            }
+            if (fab) {
+                fab.style.display = currentUser.role === 'VIEWER' ? 'none' : 'flex';
+            }
+        } else {
+            if (notifBtn) notifBtn.style.display = 'none';
+            if (secBtn) secBtn.style.display = 'none';
+            if (userWidget) userWidget.style.display = 'none';
+            if (fab) fab.style.display = 'none';
+        }
+    }
+
     // ─── API Helpers ─────────────────────────────────────────
     async function apiGet(url) {
-        const res = await fetch(url);
+        const res = await fetch(url, { headers: getAuthHeaders() });
+        if (res.status === 401 && !url.includes('/auth/login')) {
+            handleUnauthorized();
+            throw new Error('Session expired or unauthorized');
+        }
         if (!res.ok) {
             const body = await res.json().catch(() => ({}));
             throw new Error(body.error || `Request failed (${res.status})`);
@@ -137,24 +205,166 @@
     }
 
     async function apiPost(url, data) {
-        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify(data)
+        });
+        if (res.status === 401 && !url.includes('/auth/login') && !url.includes('/auth/pin/verify')) {
+            handleUnauthorized();
+            throw new Error('Session expired or unauthorized');
+        }
         const body = await res.json();
         if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
         return body;
     }
 
     async function apiPut(url, data) {
-        const res = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify(data)
+        });
+        if (res.status === 401) {
+            handleUnauthorized();
+            throw new Error('Session expired or unauthorized');
+        }
         const body = await res.json();
         if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
         return body;
     }
 
     async function apiDelete(url) {
-        const res = await fetch(url, { method: 'DELETE' });
+        const res = await fetch(url, { method: 'DELETE', headers: getAuthHeaders() });
+        if (res.status === 401) {
+            handleUnauthorized();
+            throw new Error('Session expired or unauthorized');
+        }
         const body = await res.json();
         if (!res.ok) throw new Error(body.error || body.details || `Request failed (${res.status})`);
         return body;
+    }
+
+    // ─── Login Screen Rendering (12N.1, 12N.3) ───────────────
+    function renderLogin() {
+        const bottomNav = document.getElementById('bottom-nav');
+        if (bottomNav) bottomNav.style.display = 'none';
+        const fab = document.getElementById('fab-add');
+        if (fab) fab.style.display = 'none';
+        updateHeaderAuthUI();
+
+        mainContent.innerHTML = `
+            <div class="login-wrapper">
+                <div class="login-card">
+                    <div class="login-brand">
+                        <div class="login-logo-circle">₹</div>
+                        <h2>Interest Manager</h2>
+                        <p class="login-sub">Sign in to access your financial records</p>
+                    </div>
+
+                    <form id="form-login" class="login-form">
+                        <div class="form-group">
+                            <label for="login-username">Username</label>
+                            <input type="text" id="login-username" class="form-control" placeholder="admin / staff / viewer" autocomplete="username" required autofocus>
+                        </div>
+                        <div class="form-group">
+                            <label for="login-password">Password</label>
+                            <input type="password" id="login-password" class="form-control" placeholder="••••••••" autocomplete="current-password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block btn-login" id="btn-login-submit">
+                            Sign In
+                        </button>
+                    </form>
+
+                    <div class="login-footer">
+                        <p class="text-muted" style="font-size: 0.82rem; margin-top: 1.5rem; text-align: center;">
+                            Default accounts: <code>admin</code>, <code>staff</code>, <code>viewer</code>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.getElementById('form-login').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('login-username').value.trim();
+            const password = document.getElementById('login-password').value;
+            const submitBtn = document.getElementById('btn-login-submit');
+
+            try {
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Signing in…';
+                const res = await apiPost('/api/auth/login', { username, password });
+                if (res.success && res.token) {
+                    setAuthSession(res.token, res.user);
+                    showToast(`Welcome back, ${res.user.username}!`, 'success');
+                    if (bottomNav) bottomNav.style.display = 'flex';
+                    if (fab && res.user.role !== 'VIEWER') fab.style.display = 'flex';
+                    navigate('dashboard');
+                    pollNotifications();
+                } else {
+                    showToast(res.error || 'Authentication failed', 'error');
+                }
+            } catch (err) {
+                showToast(err.message, 'error');
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Sign In';
+            }
+        });
+    }
+
+    // ─── Notification Polling & Management (12H) ─────────────
+    async function pollNotifications() {
+        if (!authToken) return;
+        try {
+            const res = await apiGet('/api/notifications/unread-count');
+            const badge = document.getElementById('notification-badge');
+            if (badge) {
+                if (res.unread_count > 0) {
+                    badge.style.display = 'flex';
+                    badge.textContent = res.unread_count > 99 ? '99+' : res.unread_count;
+                } else {
+                    badge.style.display = 'none';
+                }
+            }
+        } catch (_) {}
+    }
+
+    async function loadNotificationsDrawer() {
+        const container = document.getElementById('notification-list');
+        if (!container) return;
+        container.innerHTML = '<p class="text-muted" style="text-align: center; padding: 2rem;">Loading notifications…</p>';
+
+        try {
+            const res = await apiGet('/api/notifications');
+            const items = res.items || [];
+            if (items.length === 0) {
+                container.innerHTML = '<p class="text-muted" style="text-align: center; padding: 2rem;">No notifications yet.</p>';
+                return;
+            }
+
+            container.innerHTML = items.map(n => `
+                <div class="notif-item ${n.status === 'UNREAD' ? 'unread' : ''}" data-id="${n.id}">
+                    <div class="notif-title">${escapeHtml(n.title)}</div>
+                    <div class="notif-msg">${escapeHtml(n.message)}</div>
+                    <div class="notif-time">${formatDateShort(n.created_at)}</div>
+                </div>
+            `).join('');
+
+            container.querySelectorAll('.notif-item.unread').forEach(el => {
+                el.addEventListener('click', async () => {
+                    const id = el.dataset.id;
+                    try {
+                        await apiPut(`/api/notifications/${id}/read`, {});
+                        el.classList.remove('unread');
+                        pollNotifications();
+                    } catch (_) {}
+                });
+            });
+        } catch (err) {
+            container.innerHTML = `<p class="text-muted" style="text-align: center; color: var(--accent-danger);">Failed to load notifications: ${err.message}</p>`;
+        }
     }
 
     // ─── Route Definitions ───────────────────────────────────
@@ -166,13 +376,19 @@
         account:      { title: 'Account Detail',   render: renderAccountDetail },
         transactions: { title: 'Transactions',     render: renderTransactions },
         due:          { title: 'Due',              render: renderDue },
-        reports:      { title: 'Reports',          render: renderReports }
+        reports:      { title: 'Reports',          render: renderReports },
+        statement:    { title: 'Person Statement', render: renderPersonStatement }
     };
 
     // ─── Router ──────────────────────────────────────────────
     const mainContent = document.getElementById('main-content');
 
     function navigate(route, params = {}) {
+        if (!authToken) {
+            renderLogin();
+            return;
+        }
+
         if (!params || Object.keys(params).length === 0) {
             const parsed = parseHash();
             if (parsed.route === route) {
@@ -185,12 +401,13 @@
 
         // Nav active highlight
         let navRoute = route;
-        if (route === 'person') navRoute = 'people';
+        if (route === 'person' || route === 'statement') navRoute = 'people';
         if (route === 'account') navRoute = 'accounts';
         document.querySelectorAll('.nav-item').forEach(item => {
             item.classList.toggle('active', item.dataset.route === navRoute);
         });
 
+        updateHeaderAuthUI();
         routeData.render(params);
 
         let targetHash = `#/${route}`;
@@ -463,6 +680,7 @@
                         ${dirLabels.length === 0 ? '<span class="badge badge-closed">No Accounts</span>' : ''}
                     </div>
                     <div class="profile-actions">
+                        <button class="btn btn-secondary btn-small" id="view-person-statement-btn">📄 Statement</button>
                         <button class="btn btn-secondary btn-small" id="view-person-tx-btn">📜 Transactions</button>
                         <button class="btn btn-secondary btn-small" id="edit-person-btn">✎ Edit</button>
                         <button class="btn btn-primary btn-small" id="add-account-btn">+ Add Account</button>
@@ -526,6 +744,7 @@
             `;
 
             document.getElementById('bp2').addEventListener('click', () => navigate('people'));
+            document.getElementById('view-person-statement-btn')?.addEventListener('click', () => navigate('statement', { person_id: person.id }));
             document.getElementById('view-person-tx-btn')?.addEventListener('click', () => navigate('transactions', { person_id: person.id }));
             document.getElementById('edit-person-btn').addEventListener('click', () => openEditPersonModal(person));
             document.getElementById('add-account-btn').addEventListener('click', () => openAddAccountModal(person.id));
@@ -1093,6 +1312,7 @@
                 <div class="profile-section">
                     <div class="profile-section-title">Actions & Operations</div>
                     <div class="action-buttons">
+                        <button class="btn btn-secondary btn-small" id="view-statement-btn">📄 Statement</button>
                         <button class="btn btn-primary btn-small" id="record-allocation-btn">⚡ Record Payment (Allocate)</button>
                         <button class="btn btn-secondary btn-small" id="record-principal-btn">💰 Principal Payment</button>
                         <button class="btn btn-secondary btn-small" id="record-interest-btn">📈 Interest Payment</button>
@@ -1167,6 +1387,7 @@
             });
             document.getElementById('record-funding-btn')?.addEventListener('click', () => openRecordFundingModal(acc));
             document.getElementById('edit-account-btn')?.addEventListener('click', () => openEditAccountModal(acc));
+            document.getElementById('view-statement-btn')?.addEventListener('click', () => navigate('statement', { person_id: acc.person_id, loan_id: acc.id }));
             document.getElementById('view-tx-btn')?.addEventListener('click', () => navigate('transactions', { account_id: acc.id }));
 
             // ─── Step 5G: Interest Calculation Preview Event Handling ───
@@ -2693,7 +2914,588 @@
         mainContent.innerHTML = `<div class="page"><h2 class="page-title">Due</h2><p class="page-subtitle">Upcoming and overdue payments</p><div class="placeholder-card"><div class="icon">⏰</div><h3>Coming Soon</h3><p>View payment deadlines, overdue accounts, and send reminders.</p><div class="status-badge"><span class="dot"></span>Schema Ready</div></div></div>`;
     }
     function renderReports() {
-        mainContent.innerHTML = `<div class="page"><h2 class="page-title">Reports</h2><p class="page-subtitle">Financial insights and exports</p><div class="placeholder-card"><div class="icon">📈</div><h3>Coming Soon</h3><p>Generate statements, summaries, and export to PDF or Excel.</p><div class="status-badge"><span class="dot"></span>Schema Ready</div></div></div>`;
+        mainContent.innerHTML = `
+            <div class="page" id="page-reports">
+                <div style="margin-bottom:var(--space-md);">
+                    <h2 class="page-title">Reports, Excel Exports & Data Recovery</h2>
+                    <p class="page-subtitle">Authoritative financial reporting, spreadsheet exports (.xlsx), and full application backup/restore</p>
+                </div>
+
+                <!-- Section 1: Reports & Exports -->
+                <div style="margin-bottom:var(--space-lg);">
+                    <h3 style="font-size:var(--font-lg); font-weight:700; margin-bottom:var(--space-sm);">📊 Financial Reports & Spreadsheet Exports</h3>
+                    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-md);">
+                        
+                        <!-- Statement -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(99,102,241,0.15); padding:10px; border-radius:var(--radius-md);">📄</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">Person Statement</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Ledger, opening/closing balance & interest</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <button class="btn btn-primary btn-small" id="rpt-btn-view-stmt" style="flex:1;">View & Export</button>
+                            </div>
+                        </div>
+
+                        <!-- Loan Portfolio -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(52,211,153,0.15); padding:10px; border-radius:var(--radius-md);">📈</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">Loan Portfolio</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Principal, paid, balance & rates across loans</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <a href="/api/reports/loans/excel" class="btn btn-secondary btn-small" download style="flex:1; text-align:center;">📥 Export .xlsx</a>
+                            </div>
+                        </div>
+
+                        <!-- People Directory -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(59,130,246,0.15); padding:10px; border-radius:var(--radius-md);">👥</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">People Directory</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Active loan counts, total given & taken</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <a href="/api/reports/people/excel" class="btn btn-secondary btn-small" download style="flex:1; text-align:center;">📥 Export .xlsx</a>
+                            </div>
+                        </div>
+
+                        <!-- Transactions / Payments -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(245,158,11,0.15); padding:10px; border-radius:var(--radius-md);">💳</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">Transactions & Payments</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Complete historical transaction movements</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <a href="/api/reports/payments/excel" class="btn btn-secondary btn-small" download style="flex:1; text-align:center;">📥 Export .xlsx</a>
+                            </div>
+                        </div>
+
+                        <!-- Interest Records -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(139,92,246,0.15); padding:10px; border-radius:var(--radius-md);">⏳</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">Interest Accruals</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Accrual periods, rates & paid/outstanding interest</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <a href="/api/reports/interest/excel" class="btn btn-secondary btn-small" download style="flex:1; text-align:center;">📥 Export .xlsx</a>
+                            </div>
+                        </div>
+
+                        <!-- Due & Overdue -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(239,68,68,0.15); padding:10px; border-radius:var(--radius-md);">🚨</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">Due & Overdue</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Current deadlines, overdue days & amounts</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <a href="/api/reports/due-overdue/excel" class="btn btn-secondary btn-small" download style="flex:1; text-align:center;">📥 Export .xlsx</a>
+                            </div>
+                        </div>
+
+                        <!-- Priority Collections -->
+                        <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+                            <div>
+                                <div style="display:flex; align-items:center; gap:var(--space-md); margin-bottom:var(--space-xs);">
+                                    <div style="font-size:2rem; background:rgba(236,72,153,0.15); padding:10px; border-radius:var(--radius-md);">🎯</div>
+                                    <div>
+                                        <h3 style="font-size:var(--font-md); margin-bottom:2px;">Priority Collections</h3>
+                                        <p class="muted" style="font-size:var(--font-xs);">Overdue borrower contact list ordered by priority</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap:var(--space-xs); margin-top:var(--space-sm);">
+                                <a href="/api/reports/collections/excel" class="btn btn-secondary btn-small" download style="flex:1; text-align:center;">📥 Export .xlsx</a>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+
+                <!-- Section 2: Application Backup & Restore -->
+                <div style="margin-top:var(--space-xl);">
+                    <h3 style="font-size:var(--font-lg); font-weight:700; margin-bottom:var(--space-sm);">🛡️ Application Backup & Restore (Part 11)</h3>
+                    <div class="card" style="border: 1px solid rgba(255,255,255,0.1);">
+                        <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:var(--space-md); margin-bottom:var(--space-md);">
+                            <div>
+                                <h4 style="font-size:var(--font-md); font-weight:700; margin-bottom:4px;">Machine-Readable Application Backup</h4>
+                                <p class="muted" style="font-size:var(--font-xs); max-width:600px;">
+                                    Download a cryptographically verified SHA-256 JSON snapshot preserving all People, Loans, Transactions, Interest, and Configurations.
+                                    Restoring a backup safely replaces current application data with rollback protection.
+                                </p>
+                            </div>
+                            <div style="display:flex; gap:var(--space-sm); flex-wrap:wrap;">
+                                <a href="/api/backup/export" class="btn btn-primary btn-small" download id="btn-download-backup">
+                                    💾 Download Full Backup (.json)
+                                </a>
+                                <button class="btn btn-secondary btn-small" id="btn-trigger-restore" style="border-color:var(--accent-danger); color:var(--accent-danger);">
+                                    ⚠️ Restore from Backup
+                                </button>
+                                <input type="file" id="backup-file-input" accept=".json" style="display:none;">
+                            </div>
+                        </div>
+
+                        <!-- Backup Status Grid -->
+                        <div id="backup-status-area" style="background:rgba(0,0,0,0.2); padding:var(--space-sm) var(--space-md); border-radius:var(--radius-sm); font-size:var(--font-xs);">
+                            <span class="muted">Loading system backup status…</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.getElementById('rpt-btn-view-stmt')?.addEventListener('click', () => navigate('statement'));
+
+        // Load Backup Status
+        apiGet('/api/backup/status').then(res => {
+            const statusArea = document.getElementById('backup-status-area');
+            if (statusArea && res) {
+                const c = res.entity_counts || {};
+                statusArea.innerHTML = `
+                    <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:var(--space-sm); align-items:center;">
+                        <div>
+                            <strong>Active Database State:</strong>
+                            ${c.people || 0} People · ${c.accounts || 0} Loans · ${c.transactions || 0} Transactions · ${c.interest_records || 0} Interest Records
+                        </div>
+                        <div class="muted">
+                            Format Version: <strong>v${res.backup_format_version || 1}</strong>
+                            ${res.last_restore ? ` · Last Restore: ${formatDateDMY(res.last_restore.split('T')[0])}` : ''}
+                        </div>
+                    </div>
+                `;
+            }
+        }).catch(() => {});
+
+        // Backup Restore Handler
+        const fileInput = document.getElementById('backup-file-input');
+        const triggerBtn = document.getElementById('btn-trigger-restore');
+
+        triggerBtn?.addEventListener('click', () => {
+            const ok = confirm(
+                'CAUTION: Restoring a backup is a destructive operation that will completely replace the current application database with the backup snapshot.\n\nAre you sure you wish to proceed?'
+            );
+            if (ok) {
+                fileInput.click();
+            }
+        });
+
+        fileInput?.addEventListener('change', async (e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                let backupData;
+                try {
+                    backupData = JSON.parse(text);
+                } catch {
+                    showToast('Invalid backup file: Not valid JSON', 'error');
+                    return;
+                }
+
+                showToast('Validating backup integrity…', 'info');
+                const valRes = await apiPost('/api/backup/validate', { backup: backupData });
+                if (!valRes.success) {
+                    showToast(`Backup validation failed: ${valRes.error}`, 'error');
+                    return;
+                }
+
+                const doubleConfirm = confirm(
+                    `Backup package validated successfully!\n\nEntities in backup:\n` +
+                    Object.entries(valRes.entity_counts || {}).map(([k, v]) => ` • ${k}: ${v}`).join('\n') +
+                    `\n\nProceed to RESTORE now? This cannot be undone.`
+                );
+
+                if (doubleConfirm) {
+                    showToast('Restoring application state…', 'info');
+                    const restoreRes = await apiPost('/api/backup/restore', {
+                        backup: backupData,
+                        confirm: true
+                    });
+
+                    if (restoreRes.success) {
+                        showToast('Restore completed successfully!', 'success');
+                        setTimeout(() => navigate('dashboard'), 1000);
+                    } else {
+                        showToast(`Restore failed: ${restoreRes.error}`, 'error');
+                    }
+                }
+            } catch (err) {
+                showToast(`Restore failed: ${err.message}`, 'error');
+            } finally {
+                fileInput.value = '';
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // STEP 10G & 11G: PERSON STATEMENT + PDF & EXCEL VIEW
+    // ═══════════════════════════════════════════════════════════
+    async function renderPersonStatement(params = {}) {
+        mainContent.innerHTML = `
+            <div class="page" id="page-statement">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--space-md); flex-wrap:wrap; gap:var(--space-sm);">
+                    <div>
+                        <h2 class="page-title">Person Statement</h2>
+                        <p class="page-subtitle">Consolidated financial history, running balances, and PDF / Excel exports</p>
+                    </div>
+                    <div>
+                        <button class="btn btn-secondary btn-small" id="stmt-back-btn">← Back</button>
+                    </div>
+                </div>
+
+                <!-- Filter Controls Card -->
+                <div class="card" style="margin-bottom: var(--space-md);">
+                    <div class="filter-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+                        <div class="filter-group">
+                            <label class="filter-label" for="stmt-person-select">Person <span class="required">*</span></label>
+                            <select id="stmt-person-select" class="filter-select">
+                                <option value="">— Select Person —</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label class="filter-label" for="stmt-loan-select">Loan Account</label>
+                            <select id="stmt-loan-select" class="filter-select">
+                                <option value="">All Loans (Consolidated)</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label class="filter-label" for="stmt-start-date">From Date</label>
+                            <input type="date" id="stmt-start-date" class="filter-input">
+                        </div>
+                        <div class="filter-group">
+                            <label class="filter-label" for="stmt-end-date">To Date</label>
+                            <input type="date" id="stmt-end-date" class="filter-input">
+                        </div>
+                    </div>
+                    <div class="filter-actions" style="margin-top:var(--space-sm); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:var(--space-xs);">
+                        <button class="btn btn-primary btn-small" id="stmt-generate-btn">↻ Generate Statement</button>
+                        <div style="display:flex; gap:var(--space-xs);">
+                            <button class="btn btn-secondary btn-small" id="stmt-download-pdf-btn" disabled>📥 Download PDF</button>
+                            <button class="btn btn-secondary btn-small" id="stmt-download-excel-btn" disabled>📊 Export Excel</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Statement Content Area -->
+                <div id="stmt-content-area">
+                    <div class="loading-state"><div class="spinner"></div><p>Loading person statement…</p></div>
+                </div>
+            </div>
+        `;
+
+        document.getElementById('stmt-back-btn')?.addEventListener('click', () => {
+            const currentPId = document.getElementById('stmt-person-select')?.value || params.person_id;
+            if (currentPId) navigate('person', { id: currentPId });
+            else navigate('people');
+        });
+
+        const personSelect = document.getElementById('stmt-person-select');
+        const loanSelect = document.getElementById('stmt-loan-select');
+        const startDateInput = document.getElementById('stmt-start-date');
+        const endDateInput = document.getElementById('stmt-end-date');
+        const generateBtn = document.getElementById('stmt-generate-btn');
+        const pdfBtn = document.getElementById('stmt-download-pdf-btn');
+        const excelBtn = document.getElementById('stmt-download-excel-btn');
+        const contentArea = document.getElementById('stmt-content-area');
+
+
+        // Populate people dropdown
+        let people = [];
+        try {
+            const pRes = await apiGet('/api/people');
+            people = pRes.data || [];
+            people.forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = `${p.name}${p.phone ? ' (' + p.phone + ')' : ''}`;
+                personSelect.appendChild(opt);
+            });
+        } catch (err) {
+            console.error('Failed to load people for statement:', err);
+        }
+
+        // Set initial selected person
+        let activePersonId = params.person_id || params.id || (people.length > 0 ? people[0].id : null);
+        if (activePersonId && personSelect) {
+            personSelect.value = activePersonId;
+        }
+
+        if (params.start_date) startDateInput.value = params.start_date;
+        if (params.end_date) endDateInput.value = params.end_date;
+
+        async function updateLoanDropdown(pId, selectedLoanId = null) {
+            loanSelect.innerHTML = `<option value="">All Loans (Consolidated)</option>`;
+            if (!pId) return;
+            try {
+                const aRes = await apiGet(`/api/accounts?person_id=${pId}`);
+                const loans = aRes.data || [];
+                loans.forEach(loan => {
+                    const opt = document.createElement('option');
+                    opt.value = loan.id;
+                    opt.textContent = `Account #${String(loan.id).padStart(3, '0')} — ${loan.direction === 'MONEY_GIVEN' ? 'Lent' : 'Taken'} (${formatRupees(loan.principal)})`;
+                    if (selectedLoanId && Number(selectedLoanId) === loan.id) opt.selected = true;
+                    loanSelect.appendChild(opt);
+                });
+            } catch (err) {
+                console.error('Failed to load accounts for statement:', err);
+            }
+        }
+
+        personSelect.addEventListener('change', async () => {
+            const pId = personSelect.value;
+            await updateLoanDropdown(pId);
+            loadStatement();
+        });
+
+        loanSelect.addEventListener('change', () => {
+            loadStatement();
+        });
+
+        generateBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            loadStatement();
+        });
+
+        pdfBtn.addEventListener('click', () => {
+            const pId = personSelect.value;
+            if (!pId) return;
+            const lId = loanSelect.value;
+            const sDate = startDateInput.value;
+            const eDate = endDateInput.value;
+            const qp = new URLSearchParams();
+            if (lId) qp.set('loan_id', lId);
+            if (sDate) qp.set('start_date', sDate);
+            if (eDate) qp.set('end_date', eDate);
+            window.open(`/api/people/${pId}/statement/pdf?${qp.toString()}`, '_blank');
+        });
+
+        excelBtn.addEventListener('click', () => {
+            const pId = personSelect.value;
+            if (!pId) return;
+            const lId = loanSelect.value;
+            const sDate = startDateInput.value;
+            const eDate = endDateInput.value;
+            const qp = new URLSearchParams();
+            if (lId) qp.set('loan_id', lId);
+            if (sDate) qp.set('start_date', sDate);
+            if (eDate) qp.set('end_date', eDate);
+            window.open(`/api/people/${pId}/statement/excel?${qp.toString()}`, '_blank');
+        });
+
+        async function loadStatement() {
+            const pId = personSelect.value;
+            if (!pId) {
+                contentArea.innerHTML = `
+                    <div class="empty-state" style="padding:48px 24px">
+                        <div class="empty-icon">👤</div>
+                        <div class="empty-title">Select a Person</div>
+                        <div class="empty-description">Please choose a person to generate their financial statement.</div>
+                    </div>
+                `;
+                pdfBtn.disabled = true;
+                excelBtn.disabled = true;
+                return;
+            }
+
+            contentArea.innerHTML = `<div class="loading-state"><div class="spinner"></div><p>Calculating statement balances…</p></div>`;
+
+            const lId = loanSelect.value;
+            const sDate = startDateInput.value;
+            const eDate = endDateInput.value;
+
+            const qp = new URLSearchParams();
+            if (lId) qp.set('loan_id', lId);
+            if (sDate) qp.set('start_date', sDate);
+            if (eDate) qp.set('end_date', eDate);
+
+            try {
+                const res = await apiGet(`/api/people/${pId}/statement?${qp.toString()}`);
+                const stmt = res.data;
+                pdfBtn.disabled = false;
+                excelBtn.disabled = false;
+
+
+                const p = stmt.person;
+                const sm = stmt.summary;
+                const txs = stmt.transactions || [];
+                const loans = stmt.loans || [];
+
+                contentArea.innerHTML = `
+                    <!-- Person & Period Header -->
+                    <div class="statement-header-card">
+                        <div class="statement-person-info">
+                            <h2>${escapeHtml(p.name)}</h2>
+                            <div class="statement-person-meta">
+                                ${p.phone ? `<span>📞 ${escapeHtml(p.phone)}</span>` : ''}
+                                ${p.address ? `<span>📍 ${escapeHtml(p.address)}</span>` : ''}
+                                <span>🗓 Period: <strong>${stmt.period.start_date ? formatDateDMY(stmt.period.start_date) : 'Beginning'} → ${stmt.period.end_date ? formatDateDMY(stmt.period.end_date) : 'Present'}</strong></span>
+                                <span>🎯 Statement: <strong>${stmt.statement_type.replace('_', ' ')}</strong></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Overdue Attention Alert if applicable -->
+                    ${sm.total_overdue > 0 ? `
+                        <div class="statement-overdue-alert">
+                            <span style="font-size:1.25rem;">⚠️</span>
+                            <div>
+                                <strong>Overdue Attention Required:</strong> ${formatRupees(sm.total_overdue)} is currently overdue across obligations.
+                            </div>
+                        </div>
+                    ` : ''}
+
+                    <!-- 6-Metric KPI Summary Grid -->
+                    <div class="statement-summary-grid">
+                        <div class="statement-summary-card">
+                            <div class="statement-summary-lbl">Opening Balance</div>
+                            <div class="statement-summary-val">${formatRupees(sm.opening_balance)}</div>
+                        </div>
+                        <div class="statement-summary-card">
+                            <div class="statement-summary-lbl">Total Principal</div>
+                            <div class="statement-summary-val">${formatRupees(sm.total_principal)}</div>
+                        </div>
+                        <div class="statement-summary-card">
+                            <div class="statement-summary-lbl">Total Payments</div>
+                            <div class="statement-summary-val" style="color:var(--accent-success)">${formatRupees(sm.total_payments)}</div>
+                        </div>
+                        <div class="statement-summary-card">
+                            <div class="statement-summary-lbl">Total Interest</div>
+                            <div class="statement-summary-val" style="color:var(--accent-secondary)">${formatRupees(sm.total_interest)}</div>
+                        </div>
+                        <div class="statement-summary-card ${sm.total_overdue > 0 ? 'alert' : ''}">
+                            <div class="statement-summary-lbl">Overdue Amount</div>
+                            <div class="statement-summary-val" style="color:${sm.total_overdue > 0 ? 'var(--accent-danger)' : 'var(--text-muted)'}">${formatRupees(sm.total_overdue)}</div>
+                        </div>
+                        <div class="statement-summary-card highlight">
+                            <div class="statement-summary-lbl">Closing Balance</div>
+                            <div class="statement-summary-val" style="color:var(--accent-primary)">${formatRupees(sm.closing_balance)}</div>
+                        </div>
+                    </div>
+
+                    <!-- Associated Accounts / Loans -->
+                    <div class="profile-section">
+                        <div class="profile-section-title">Loan Accounts (${loans.length})</div>
+                        <div class="ledger-table-wrapper" style="margin-bottom:var(--space-md); overflow-x:auto;">
+                            <table class="ledger-table">
+                                <thead>
+                                    <tr>
+                                        <th>Account</th>
+                                        <th>Direction</th>
+                                        <th>Principal</th>
+                                        <th>Rate</th>
+                                        <th>Status</th>
+                                        <th>Due Date</th>
+                                        <th style="text-align:right">Outstanding</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${loans.map(l => `
+                                        <tr>
+                                            <td><strong>Account #${String(l.id).padStart(3, '0')}</strong></td>
+                                            <td><span class="badge ${l.direction === 'MONEY_GIVEN' ? 'badge-given' : 'badge-taken'}">${l.direction === 'MONEY_GIVEN' ? 'Money Lent' : 'Money Taken'}</span></td>
+                                            <td>${formatRupees(l.principal)}</td>
+                                            <td>${l.interest_rate}% ${frequencyLabel(l.interest_frequency)}</td>
+                                            <td><span class="badge ${statusBadgeClass(l.status)}">${l.status}</span></td>
+                                            <td>${formatDateDMY(l.due_date)}</td>
+                                            <td style="text-align:right; font-weight:700;">${formatRupees(l.outstanding_principal)}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Transaction Ledger -->
+                    <div class="profile-section">
+                        <div class="profile-section-title">Transaction Ledger (${txs.length})</div>
+                        ${txs.length === 0 ? `
+                            <div class="empty-state" style="padding:32px 16px;">
+                                <div class="empty-icon">📜</div>
+                                <div class="empty-title">No transactions in this period</div>
+                                <div class="empty-description">There are no financial movements recorded between the selected dates.</div>
+                            </div>
+                        ` : `
+                            <div class="ledger-table-wrapper" style="overflow-x:auto;">
+                                <table class="ledger-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Date</th>
+                                            <th>Account</th>
+                                            <th>Type</th>
+                                            <th>Reference / Notes</th>
+                                            <th style="text-align:right">Debit (₹)</th>
+                                            <th style="text-align:right">Credit (₹)</th>
+                                            <th style="text-align:right">Running Balance</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${txs.map(tx => `
+                                            <tr>
+                                                <td><strong>${formatDateDMY(tx.date)}</strong></td>
+                                                <td>${tx.account_id ? `Account #${String(tx.account_id).padStart(3, '0')}` : '—'}</td>
+                                                <td><span class="badge ${tx.type.includes('PAYMENT') ? 'badge-active' : 'badge-pending'}">${tx.type.replace(/_/g, ' ')}</span></td>
+                                                <td><span class="muted">${escapeHtml(tx.description || tx.reference || '—')}</span></td>
+                                                <td style="text-align:right; color:var(--accent-danger); font-weight:600;">${tx.debit_paisa > 0 ? formatRupees(tx.debit_paisa) : '—'}</td>
+                                                <td style="text-align:right; color:var(--accent-success); font-weight:600;">${tx.credit_paisa > 0 ? formatRupees(tx.credit_paisa) : '—'}</td>
+                                                <td style="text-align:right; font-weight:700;">${formatRupees(tx.running_balance_paisa)}</td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        `}
+                    </div>
+                `;
+
+            } catch (err) {
+                contentArea.innerHTML = `
+                    <div class="empty-state" style="padding:48px 24px">
+                        <div class="empty-icon">⚠️</div>
+                        <div class="empty-title">Could not load statement</div>
+                        <div class="empty-description">${escapeHtml(err.message)}</div>
+                    </div>
+                `;
+                pdfBtn.disabled = true;
+                excelBtn.disabled = true;
+
+            }
+        }
+
+        // Initialize loan dropdown and load statement
+        if (activePersonId) {
+            await updateLoanDropdown(activePersonId, params.loan_id);
+            await loadStatement();
+        }
     }
 
     // ─── Event Listeners ─────────────────────────────────────
@@ -2718,6 +3520,153 @@
     });
 
     window.addEventListener('hashchange', () => { const p = parseHash(); navigate(p.route, p.params); });
+
+    // ─── Part 12 UI Event Listeners ──────────────────────────
+    const logoutBtn = document.getElementById('btn-logout');
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            if (confirm('Are you sure you want to sign out?')) {
+                try { await apiPost('/api/auth/logout', {}); } catch (_) {}
+                setAuthSession(null, null);
+                showToast('Signed out successfully.', 'info');
+                renderLogin();
+            }
+        });
+    }
+
+    // Notification Drawer
+    const notifBtn = document.getElementById('btn-notifications');
+    const notifDrawer = document.getElementById('notification-drawer');
+    const closeNotifBtn = document.getElementById('btn-close-notifications');
+    const markAllReadBtn = document.getElementById('btn-mark-all-read');
+
+    if (notifBtn && notifDrawer) {
+        notifBtn.addEventListener('click', () => {
+            notifDrawer.style.display = 'flex';
+            loadNotificationsDrawer();
+        });
+    }
+    if (closeNotifBtn && notifDrawer) {
+        closeNotifBtn.addEventListener('click', () => {
+            notifDrawer.style.display = 'none';
+        });
+    }
+    if (markAllReadBtn) {
+        markAllReadBtn.addEventListener('click', async () => {
+            try {
+                await apiPost('/api/notifications/mark-all-read', {});
+                showToast('All notifications marked as read', 'success');
+                loadNotificationsDrawer();
+                pollNotifications();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    }
+
+    // Security Modal
+    const secBtn = document.getElementById('btn-security-settings');
+    const secModal = document.getElementById('security-modal');
+    const closeSecBtn = document.getElementById('btn-close-security');
+
+    if (secBtn && secModal) {
+        secBtn.addEventListener('click', () => {
+            secModal.style.display = 'flex';
+            const pinCredLabel = document.getElementById('pin-cred-label');
+            if (pinCredLabel) {
+                pinCredLabel.textContent = (currentUser && currentUser.has_pin) ? 'Current Password or PIN' : 'Current Account Password';
+            }
+            const sessBox = document.getElementById('session-info-box');
+            if (sessBox && currentUser) {
+                sessBox.innerHTML = `
+                    <div style="font-size: 0.85rem; line-height: 1.6;">
+                        <div><strong>Logged in as:</strong> ${escapeHtml(currentUser.username)} (${escapeHtml(currentUser.role)})</div>
+                        <div><strong>Token:</strong> <code>${escapeHtml(authToken ? authToken.slice(0, 8) + '…' + authToken.slice(-8) : '—')}</code></div>
+                        <div style="margin-top: 8px; color: var(--accent-success); font-size: 0.8rem;">● Current Session Active</div>
+                    </div>
+                `;
+            }
+        });
+    }
+    if (closeSecBtn && secModal) {
+        closeSecBtn.addEventListener('click', () => {
+            secModal.style.display = 'none';
+        });
+    }
+
+    // Security Tabs
+    document.querySelectorAll('.sec-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            document.querySelectorAll('.sec-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.sec-tab-content').forEach(c => c.style.display = 'none');
+            tab.classList.add('active');
+            const targetId = `sec-tab-${tab.dataset.tab}`;
+            const targetEl = document.getElementById(targetId);
+            if (targetEl) targetEl.style.display = 'block';
+        });
+    });
+
+    // Form Change Password
+    const formChangePass = document.getElementById('form-change-password');
+    if (formChangePass) {
+        formChangePass.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const curPass = document.getElementById('input-cur-password').value;
+            const newPass = document.getElementById('input-new-password').value;
+            try {
+                const res = await apiPost('/api/auth/change-password', {
+                    current_password: curPass,
+                    new_password: newPass
+                });
+                showToast(res.message || 'Password changed successfully! Please log in again.', 'success');
+                secModal.style.display = 'none';
+                setAuthSession(null, null);
+                renderLogin();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    }
+
+    // Form Change PIN
+    const formChangePin = document.getElementById('form-change-pin');
+    if (formChangePin) {
+        formChangePin.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const cred = document.getElementById('input-pin-cred').value;
+            const newPin = document.getElementById('input-new-pin').value;
+            const confirmPin = document.getElementById('input-confirm-pin').value;
+
+            if (newPin !== confirmPin) {
+                showToast('New PIN and Confirm PIN do not match', 'error');
+                return;
+            }
+
+            try {
+                let res;
+                if (!currentUser || !currentUser.has_pin) {
+                    res = await apiPost('/api/auth/pin/setup', { pin: newPin, confirm_pin: confirmPin });
+                } else {
+                    res = await apiPost('/api/auth/pin/change', {
+                        current_credential: cred,
+                        new_pin: newPin,
+                        confirm_pin: confirmPin
+                    });
+                }
+                showToast('PIN configured successfully!', 'success');
+                if (currentUser) currentUser.has_pin = true;
+                setAuthSession(authToken, currentUser);
+                secModal.style.display = 'none';
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    }
+
+    // Notification polling (every 60s)
+    setInterval(pollNotifications, 60000);
+    if (authToken) pollNotifications();
 
     // ─── Initial Load ────────────────────────────────────────
     const initial = parseHash();

@@ -60,3 +60,13 @@ INSERT INTO accounts (
     10.0, 'MONTHLY', 'SIMPLE_INTEREST',
     '2026-08-01', '2026-09-01', 'ACTIVE'
 );
+
+-- ============================================================
+-- Initial Interest Configurations (Step 6A)
+-- ============================================================
+INSERT INTO account_interest_configs (account_id, calculation_method, interest_rate, effective_from, effective_to) VALUES
+(1, 'SIMPLE_INTEREST', 15.0, '2026-08-01', NULL),
+(2, 'SIMPLE_INTEREST', 15.0, '2026-09-01', NULL),
+(3, 'SIMPLE_INTEREST', 18.0, '2026-09-10', NULL),
+(4, 'SIMPLE_INTEREST', 10.0, '2026-08-01', NULL);
+
