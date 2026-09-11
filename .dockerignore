@@ -1,8 +1,12 @@
-node_modules/
+node_modules
+.git
+.gitignore
 .env
+*.md
+tests
+.DS_Store
+Thumbs.db
+*.log
 db/interest_manager.db
 db/interest_manager.db-wal
 db/interest_manager.db-shm
-*.log
-.DS_Store
-Thumbs.db

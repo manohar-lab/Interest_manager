@@ -1,0 +1,14 @@
+# render.yaml — Render Blueprint (Infrastructure as Code)
+# Deploy: https://render.com/deploy → connect your GitHub repo
+# Or: Render Dashboard → New → Web Service → select this repo
+
+services:
+  - type: web
+    name: interest-manager
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run db:init
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production

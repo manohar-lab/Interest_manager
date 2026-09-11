@@ -7,6 +7,9 @@ const { registerScheduler, stopScheduler } = require('./services/schedulerServic
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Trust reverse proxy (Render, Docker, etc.) for correct client IP in rate limiter
+app.set('trust proxy', 1);
+
 // ─── Middleware ──────────────────────────────────────────────
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -74,7 +77,7 @@ async function start() {
         const tableCount = stmt.getAsObject().count;
         stmt.free();
 
-        app.listen(PORT, () => {
+        app.listen(PORT, '0.0.0.0', () => {
             console.log(`\n  ✦ Interest Manager running at http://localhost:${PORT}`);
             console.log(`  ✦ Database: ${tableCount} tables connected`);
             console.log(`  ✦ Press Ctrl+C to stop\n`);
