@@ -2,7 +2,8 @@
 
 > **System Status:** 100% Production Ready & Hardened (Parts 1 – 13 Complete)  
 > **Release Decision:** **GO FOR PRODUCTION RELEASE**  
-> **Test Validation:** 26/26 Master Verification Tests Passed (100% Pass Rate)
+> **Test Validation:** 26/26 Master Verification Tests Passed (100% Pass Rate)  
+> **Live Demo:** [https://interest-manager.onrender.com](https://interest-manager.onrender.com)
 
 ---
 
